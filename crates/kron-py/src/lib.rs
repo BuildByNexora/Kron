@@ -20,7 +20,7 @@ use kron_core::timer::{RunId, TimerId, TimerState, TimerSummary};
 use kron_core::Engine;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyModule};
+use pyo3::types::{PyDict, PyList, PyModule, PyTuple};
 
 static GLOBAL: OnceLock<Mutex<GlobalState>> = OnceLock::new();
 const DEFAULT_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -234,13 +234,13 @@ fn start(py: Python<'_>, data_dir: Option<String>) -> PyResult<()> {
 
 #[pyfunction(signature = (data_dir=None))]
 fn astart(py: Python<'_>, data_dir: Option<String>) -> PyResult<PyObject> {
-    let asyncio = py.import_bound("asyncio")?;
     let kron = py.import_bound("kron")?;
     let start_fn = kron.getattr("start")?;
-    let coroutine = match data_dir {
-        Some(data_dir) => asyncio.getattr("to_thread")?.call1((start_fn, data_dir))?,
-        None => asyncio.getattr("to_thread")?.call1((start_fn,))?,
+    let args = match data_dir {
+        Some(data_dir) => PyTuple::new_bound(py, [data_dir.into_py(py)]),
+        None => PyTuple::empty_bound(py),
     };
+    let coroutine = call_in_async_thread(py, start_fn, args)?;
     Ok(coroutine.unbind().into())
 }
 
@@ -291,12 +291,10 @@ fn shutdown(py: Python<'_>, timeout: f64) -> PyResult<()> {
 
 #[pyfunction(signature = (timeout=5.0))]
 fn ashutdown(py: Python<'_>, timeout: f64) -> PyResult<PyObject> {
-    let asyncio = py.import_bound("asyncio")?;
     let kron = py.import_bound("kron")?;
     let shutdown_fn = kron.getattr("shutdown")?;
-    let coroutine = asyncio
-        .getattr("to_thread")?
-        .call1((shutdown_fn, timeout))?;
+    let args = PyTuple::new_bound(py, [timeout.into_py(py)]);
+    let coroutine = call_in_async_thread(py, shutdown_fn, args)?;
     Ok(coroutine.unbind().into())
 }
 
@@ -317,10 +315,10 @@ fn status(py: Python<'_>, name: String) -> PyResult<Option<PyObject>> {
 
 #[pyfunction]
 fn astatus(py: Python<'_>, name: String) -> PyResult<PyObject> {
-    let asyncio = py.import_bound("asyncio")?;
     let kron = py.import_bound("kron")?;
     let status_fn = kron.getattr("status")?;
-    let coroutine = asyncio.getattr("to_thread")?.call1((status_fn, name))?;
+    let args = PyTuple::new_bound(py, [name.into_py(py)]);
+    let coroutine = call_in_async_thread(py, status_fn, args)?;
     Ok(coroutine.unbind().into())
 }
 
@@ -342,11 +340,36 @@ fn list(py: Python<'_>) -> PyResult<Vec<PyObject>> {
 
 #[pyfunction]
 fn alist(py: Python<'_>) -> PyResult<PyObject> {
-    let asyncio = py.import_bound("asyncio")?;
     let kron = py.import_bound("kron")?;
     let list_fn = kron.getattr("list")?;
-    let coroutine = asyncio.getattr("to_thread")?.call1((list_fn,))?;
+    let coroutine = call_in_async_thread(py, list_fn, PyTuple::empty_bound(py))?;
     Ok(coroutine.unbind().into())
+}
+
+fn call_in_async_thread<'py>(
+    py: Python<'py>,
+    callable: Bound<'py, PyAny>,
+    args: Bound<'py, PyTuple>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let asyncio = py.import_bound("asyncio")?;
+    if let Ok(to_thread) = asyncio.getattr("to_thread") {
+        let mut values = Vec::with_capacity(args.len() + 1);
+        values.push(callable.clone().into_any().unbind());
+        values.extend(args.iter().map(|arg| arg.unbind()));
+        let call_args = PyTuple::new_bound(py, values);
+        return to_thread.call1(call_args);
+    }
+
+    let loop_ = asyncio.call_method0("get_running_loop")?;
+    let functools = py.import_bound("functools")?;
+    let partial = functools.getattr("partial")?.call1({
+        let mut values = Vec::with_capacity(args.len() + 1);
+        values.push(callable.into_any().unbind());
+        values.extend(args.iter().map(|arg| arg.unbind()));
+        let call_args = PyTuple::new_bound(py, values);
+        call_args
+    })?;
+    loop_.call_method1("run_in_executor", (py.None(), partial))
 }
 
 #[pyclass]

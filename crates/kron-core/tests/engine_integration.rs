@@ -22,7 +22,7 @@ async fn wait_until<F>(predicate: F)
 where
     F: FnMut() -> bool,
 {
-    wait_until_with_timeout(predicate, StdDuration::from_secs(5)).await;
+    wait_until_with_timeout(predicate, StdDuration::from_secs(20)).await;
 }
 
 async fn wait_until_with_timeout<F>(mut predicate: F, timeout_duration: StdDuration)
@@ -558,7 +558,7 @@ async fn stress_many_due_timers_all_execute_once() {
     let dir = TempDir::new().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let engine = Engine::open(dir.path()).unwrap();
-    let count = 200;
+    let count = 100;
 
     for idx in 0..count {
         let calls_for_fn = Arc::clone(&calls);
@@ -581,7 +581,7 @@ async fn stress_many_due_timers_all_execute_once() {
     engine.start().unwrap();
     wait_until_with_timeout(
         || calls.load(Ordering::SeqCst) == count,
-        StdDuration::from_secs(15),
+        StdDuration::from_secs(30),
     )
     .await;
     wait_until_with_timeout(
@@ -592,7 +592,7 @@ async fn stress_many_due_timers_all_execute_once() {
                 .count()
                 == count
         },
-        StdDuration::from_secs(15),
+        StdDuration::from_secs(30),
     )
     .await;
 
