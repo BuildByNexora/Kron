@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod clock;
-pub mod cluster;
+#[allow(dead_code)]
+mod cluster;
 pub mod engine;
 pub mod error;
 pub mod event;

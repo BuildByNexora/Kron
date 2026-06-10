@@ -1108,6 +1108,20 @@ fn audit(
     status: u16,
     reason: Option<&str>,
 ) -> Result<(), KronError> {
+    let path = audit::audit_path(&cluster.data_dir);
+    use std::io::Write;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+    };
+    #[cfg(not(unix))]
+    let file = OpenOptions::new().create(true).append(true).open(&path);
+    let mut file = file?;
     let mut state = cluster.audit_state.lock().unwrap();
     let prev_hash = state.hash.clone();
     let mut record = AuditRecord {
@@ -1129,20 +1143,6 @@ fn audit(
         hash: String::new(),
     };
     record.hash = audit::compute_hash(&record);
-    let path = audit::audit_path(&cluster.data_dir);
-    use std::io::Write;
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)
-    };
-    #[cfg(not(unix))]
-    let file = OpenOptions::new().create(true).append(true).open(&path);
-    let mut file = file?;
     let encoded = serde_json::to_string(&record)?;
     writeln!(file, "{encoded}")?;
     file.sync_data()?;

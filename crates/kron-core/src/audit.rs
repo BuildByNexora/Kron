@@ -84,16 +84,21 @@ pub fn read_last_state_unverified(data_dir: &Path) -> Result<AuditState, KronErr
     }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
+    let lines = reader.lines().collect::<Result<Vec<_>, _>>()?;
+    let last_non_empty = lines.iter().rposition(|line| !line.trim().is_empty());
     let mut state = AuditState {
         seq: 0,
         hash: String::new(),
     };
-    for line in reader.lines() {
-        let line = line?;
+    for (line_no, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let record: AuditRecord = serde_json::from_str(&line)?;
+        let record: AuditRecord = match serde_json::from_str(line) {
+            Ok(record) => record,
+            Err(err) if Some(line_no) == last_non_empty && err.is_eof() => break,
+            Err(err) => return Err(err.into()),
+        };
         state.seq = record.seq;
         state.hash = record.hash;
     }
@@ -107,15 +112,35 @@ pub fn verify(data_dir: &Path) -> Result<AuditVerification, String> {
     }
     let file = File::open(path).map_err(|err| err.to_string())?;
     let reader = BufReader::new(file);
+    let lines = reader
+        .lines()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    let last_non_empty = lines.iter().rposition(|line| !line.trim().is_empty());
     let mut expected_prev = String::new();
+    let mut expected_seq = 1u64;
     let mut records = 0u64;
-    for (line_no, line) in reader.lines().enumerate() {
-        let line = line.map_err(|err| err.to_string())?;
+    for (line_no, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let record: AuditRecord = serde_json::from_str(&line)
-            .map_err(|err| format!("TAMPERED: line={} invalid json: {}", line_no + 1, err))?;
+        let record: AuditRecord = match serde_json::from_str(line) {
+            Ok(record) => record,
+            Err(err) if Some(line_no) == last_non_empty && err.is_eof() => break,
+            Err(err) => {
+                return Err(format!(
+                    "TAMPERED: line={} invalid json: {}",
+                    line_no + 1,
+                    err
+                ));
+            }
+        };
+        if record.seq != expected_seq {
+            return Err(format!(
+                "TAMPERED: record seq={} sequence mismatch, expected {}",
+                record.seq, expected_seq
+            ));
+        }
         if record.prev_hash != expected_prev {
             return Err(format!(
                 "TAMPERED: record seq={} prev_hash mismatch",
@@ -127,6 +152,7 @@ pub fn verify(data_dir: &Path) -> Result<AuditVerification, String> {
             return Err(format!("TAMPERED: record seq={} hash mismatch", record.seq));
         }
         expected_prev = record.hash;
+        expected_seq += 1;
         records += 1;
     }
     Ok(AuditVerification { records })
@@ -191,5 +217,39 @@ mod tests {
         .unwrap();
         let err = verify(dir.path()).unwrap_err();
         assert!(err.contains("hash mismatch"));
+    }
+
+    #[test]
+    fn rejects_missing_sequence_number() {
+        let dir = TempDir::new().unwrap();
+        let first = record(1, String::new(), "worker.poll");
+        let second = record(3, first.hash.clone(), "run.succeed");
+        std::fs::write(
+            audit_path(dir.path()),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap()
+            ),
+        )
+        .unwrap();
+        let err = verify(dir.path()).unwrap_err();
+        assert!(err.contains("sequence mismatch"));
+    }
+
+    #[test]
+    fn ignores_truncated_final_audit_tail() {
+        let dir = TempDir::new().unwrap();
+        let first = record(1, String::new(), "worker.poll");
+        std::fs::write(
+            audit_path(dir.path()),
+            format!("{}\n{{\"seq\":", serde_json::to_string(&first).unwrap()),
+        )
+        .unwrap();
+        let result = verify(dir.path()).unwrap();
+        assert_eq!(result.records, 1);
+        let state = read_last_state(dir.path()).unwrap();
+        assert_eq!(state.seq, 1);
+        assert_eq!(state.hash, first.hash);
     }
 }

@@ -171,10 +171,25 @@ pub fn request(
     stream
         .read_to_string(&mut response)
         .map_err(|e| e.to_string())?;
-    let (_, body) = response
+    let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| "invalid HTTP response".to_string())?;
-    serde_json::from_str(body).map_err(|e| e.to_string())
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| "invalid HTTP status line".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    if !(200..300).contains(&status) {
+        let message = value
+            .get("error")
+            .or_else(|| value.get("message"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("server request failed");
+        return Err(format!("HTTP {status}: {message}"));
+    }
+    Ok(value)
 }
 
 #[derive(Deserialize)]
