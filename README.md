@@ -37,6 +37,41 @@ server that assigns serializable tasks to workers.
 
 ---
 
+## Key Strengths
+
+Kron is built to make scheduled application work reliable without adding a large
+infrastructure stack.
+
+| Strength | What it means |
+|---|---|
+| Embedded first | Runs inside the Python process with no scheduler server required |
+| Rust core | Scheduling, persistence, retry, locking, IPC, and server mode run in Rust |
+| No external broker | Embedded mode does not require Redis, RabbitMQ, Celery, or RQ |
+| No external database | Timer metadata and history are stored locally under `.kron/` |
+| Durable event log | Timer transitions are written to an append-only AOF |
+| Crash recovery | Timer metadata, retry state, status, and history are restored after restart |
+| Snapshot and compaction | Startup stays fast while preserving durable state |
+| Single-writer safety | `.kron/kron.lock` prevents two runtimes from corrupting storage |
+| Non-blocking Python API | `kron.start()` runs the scheduler in a background Rust runtime thread |
+| GIL-aware callbacks | Python GIL is used only when Python callback code is actually executed |
+| Observable timers | CLI and Python APIs expose list, status, history, retries, and failures |
+| Built-in retry | Failed callbacks can retry with runtime-managed attempt state |
+| Async wrapper | `await kron.astart()`, `await kron.alist()`, and `await kron.ashutdown()` |
+| Local IPC | CLI can inspect and administer an active embedded runtime |
+| Token authentication | IPC and server APIs use bearer/token authentication |
+| Role-based server auth | Server mode supports `reader`, `worker`, `operator`, `admin`, and `raft` roles |
+| Online token reload | `kron.tokens.json` can be updated without restarting the server |
+| Tenant-scoped workers | Server timers and worker polling can be scoped by `tenant_id` |
+| Audit log | Server security decisions are written to append-only JSONL audit events |
+| Distributed mode | OpenRaft-backed server mode supports leader election and replication |
+| Worker leases | Abandoned distributed runs can be reclaimed after lease expiry |
+| Fencing tokens | Stale distributed workers are rejected during completion |
+| Storage corruption checks | Middle corruption fails loudly; final truncated tails are handled deterministically |
+| Tested failure paths | Crash recovery, compaction, lock conflicts, failover, stale completion, and stress tests are covered |
+| PyPI package | Install with `pip install kron-scheduler` and import with `import kron` |
+
+---
+
 ## What Kron Replaces
 
 Kron replaces the pile of infrastructure commonly added just to run scheduled
@@ -120,6 +155,50 @@ Kron stores the runtime state:
   kron.lock
   kron.token
 ```
+
+---
+
+## Concurrency Model
+
+Kron is designed around a clear single-writer model for local embedded storage.
+
+### Data Directory Locking
+
+Embedded mode writes to local files under `.kron/`. To protect those files,
+Kron takes an exclusive lock on:
+
+```text
+.kron/kron.lock
+```
+
+That means:
+
+- one runtime owns one data directory;
+- a second Python process cannot write to the same `.kron/` directory;
+- conflicting writers fail fast with `DataDirLocked`;
+- `kron.aof` and `kron.snapshot` are protected from concurrent writer
+  corruption;
+- CLI read/admin commands can still inspect an active runtime through IPC.
+
+This gives local scheduling the safety property most homemade cron replacements
+miss: there is one authoritative writer for timer state.
+
+### PyO3 Threading And The Python GIL
+
+`kron.start()` is non-blocking. The Rust scheduler runs in a background runtime
+thread, so the Python application's main thread keeps running.
+
+Kron keeps the Python GIL out of the scheduler hot path:
+
+- timer storage, heap scheduling, retry decisions, IPC, and compaction run in
+  Rust;
+- Python code is entered only when a scheduled callback must execute;
+- callback execution reacquires the GIL at the boundary where Python is actually
+  called;
+- async wrappers use the same runtime without blocking the event loop.
+
+This keeps the scheduler scalable inside normal Python applications while still
+allowing callbacks to be plain Python functions.
 
 ---
 
@@ -343,6 +422,134 @@ Core storage properties:
 - deterministic handling of truncated final log records;
 - fatal error on corrupted middle storage records;
 - exclusive data directory lock for writers.
+
+---
+
+## Persistence And Reliability
+
+Kron stores time as durable state.
+
+Reliability properties:
+
+- timer state is persisted to disk;
+- run history is queryable after restart;
+- retry state survives process restarts;
+- snapshots are written atomically;
+- final crash tails are handled deterministically;
+- corrupted middle records stop recovery loudly;
+- one writer owns one data directory;
+- distributed workers use leases and fencing tokens;
+- security decisions are auditable in server mode.
+
+Every important timer transition is written before the runtime depends on it:
+
+```text
+Python schedule()
+      |
+      v
+Rust engine
+      |
+      v
+append event to kron.aof
+      |
+      v
+fsync
+      |
+      v
+in-memory state updated
+```
+
+The append-only file is the source of truth:
+
+```text
+kron.aof
+  TIMER_CREATED cleanup
+  RUN_DUE cleanup
+  RUN_STARTED cleanup
+  RUN_SUCCEEDED cleanup
+```
+
+On restart, Kron rebuilds state from durable storage:
+
+```text
+kron.snapshot  +  kron.aof tail
+      |
+      v
+replay events
+      |
+      v
+restore timers, next runs, retry state, history
+```
+
+This gives Kron reliable recovery after process exit, restart, or machine crash.
+The runtime can recover timer metadata, next execution time, last status, retry
+state, and run history from local files.
+
+### Snapshot And Compaction
+
+The append-only log grows over time. Kron periodically compacts derived state
+into a snapshot:
+
+```text
+kron.aof                 many events
+      |
+      v
+kron.snapshot.tmp        write new snapshot
+      |
+      v
+fsync snapshot
+      |
+      v
+atomic rename
+      |
+      v
+kron.snapshot            stable checkpoint
+```
+
+After compaction:
+
+```text
+kron.snapshot            current state checkpoint
+kron.aof                 new append-only tail
+kron.aof.old             previous log copy
+```
+
+This keeps startup fast while preserving a simple recovery model.
+
+### Crash Behavior
+
+Kron treats storage corruption differently depending on where it appears:
+
+| Condition | Behavior |
+|---|---|
+| clean shutdown | state is already persisted |
+| process killed after events | replay restores persisted timer state |
+| crash during final append | truncated final tail is ignored deterministically |
+| corruption in the middle of the log | startup fails loudly |
+| crash during snapshot write | previous snapshot remains valid |
+| second writer on same data dir | rejected by `kron.lock` |
+
+The design favors explicit failure over silent data loss. A bad middle record is
+treated as real corruption; a partially written final record is treated as a
+normal crash tail.
+
+### What Persists
+
+Kron persists:
+
+- timer definitions;
+- schedule type and next run time;
+- retry policy and retry state;
+- last run status;
+- run history;
+- orphaned timer metadata after restart;
+- distributed worker task payloads;
+- Raft state for server mode;
+- audit events for server security decisions.
+
+Python callback objects are not serialized. After a Python process restarts, the
+application re-registers callbacks by calling `kron.schedule(...)` again. The
+stored timer metadata reconnects to the registered function.
 
 ---
 
