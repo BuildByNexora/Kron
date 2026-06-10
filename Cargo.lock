@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "kron-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "clap",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "kron-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "chrono",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "kron-py"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "kron-core",

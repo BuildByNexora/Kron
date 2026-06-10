@@ -42,17 +42,17 @@ Publishing can be done locally:
 
 Or through GitHub Actions:
 
-1. Create the PyPI project `kron-scheduler`.
-2. Create a GitHub environment named `pypi`.
-3. Configure PyPI Trusted Publishing for `BuildByNexora/Kron`, workflow
+1. Confirm the PyPI project `kron-scheduler` exists and is owned by the release account.
+2. Confirm the GitHub environment `pypi` exists.
+3. Confirm PyPI Trusted Publishing is configured for `BuildByNexora/Kron`, workflow
    `.github/workflows/publish.yml`, environment `pypi`.
 4. Create and push a version tag:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
-5. Run the `Publish` workflow manually and pass `v0.1.1`.
+5. Run the `Publish` workflow manually and pass `v0.1.2`.
 
 After publishing, create a GitHub release with the same version tag and note that distributed mode is experimental.

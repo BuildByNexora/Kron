@@ -33,6 +33,108 @@ The server is a deployment mode, not the product.
 
 ---
 
+## Start Here
+
+If you just want to use Kron in a Python app, this is the path:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -U pip
+.venv/bin/pip install kron-scheduler
+```
+
+Then create a timer:
+
+```python
+import time
+import kron
+
+def cleanup():
+    print("cleanup ran")
+
+kron.schedule("cleanup", every="30m", fn=cleanup)
+kron.start(data_dir=".kron")
+
+try:
+    while True:
+        time.sleep(60)
+finally:
+    kron.shutdown()
+```
+
+Inspect it from another terminal:
+
+```bash
+kron job list
+kron job status cleanup
+kron job history cleanup
+```
+
+Use embedded mode first. It is the main product today.
+
+---
+
+## User-Friendly Overview
+
+Kron is for the boring scheduled work every application eventually grows:
+
+- run a cleanup every 30 minutes;
+- send a digest every morning;
+- retry something later;
+- run one task at a specific time;
+- see whether yesterday's scheduled work succeeded.
+
+With normal cron, your app usually does not know what happened. With Kron, every
+timer has state:
+
+- when it last ran;
+- whether it succeeded;
+- what error happened;
+- when it will run next;
+- whether it is waiting for retry;
+- whether its Python function is currently registered.
+
+The simplest mental model is:
+
+```text
+cron expression + Python callback + persistent state + history
+```
+
+Kron does not require Redis, RabbitMQ, Postgres, Celery, Kubernetes, or a cloud
+scheduler for the embedded path.
+
+---
+
+## Detailed Technical Overview
+
+Kron is split into three layers:
+
+- `kron-core`: Rust engine, timer heap, event log, snapshots, locking, IPC, and experimental OpenRaft server support.
+- `kron-py`: PyO3 bindings exposing `import kron`.
+- `kron-cli`: observe/admin CLI for status, history, compaction, runtime control, and server experiments.
+
+Embedded mode stores local state in a data directory:
+
+```text
+.kron/
+  kron.aof
+  kron.snapshot
+  kron.lock
+  kron.token
+  kron.sock / kron.port
+```
+
+The embedded engine is single-writer. If another process already owns the same
+data directory, Kron fails fast instead of letting two writers corrupt the log.
+
+The event log is append-only. Snapshots and compaction reduce replay cost. The
+storage format is versioned, but not guaranteed stable before `v1.0`.
+
+Distributed/server mode is a separate alpha path. It uses serializable task
+names and JSON payloads instead of Python callback objects.
+
+---
+
 ## What It Does Today
 
 Kron currently provides an embedded Python runtime backed by a Rust engine.
@@ -140,6 +242,32 @@ pip install kron-scheduler
 
 > The package name is `kron-scheduler` because `kron` is already occupied on PyPI.
 > The Python import remains `import kron`.
+
+On Ubuntu/Debian, system Python may reject global `pip install` with:
+
+```text
+error: externally-managed-environment
+```
+
+That is normal. Use a virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -U pip
+.venv/bin/pip install kron-scheduler
+.venv/bin/python -c "import kron; print(kron)"
+```
+
+If `venv` is missing:
+
+```bash
+sudo apt install python3-full
+```
+
+Avoid `--break-system-packages` unless you intentionally want to modify the
+system Python installation.
+
+For local development from the repository:
 
 ```bash
 python -m venv .venv
@@ -341,7 +469,7 @@ X-Kron-Fencing-Token: 42
 
 ## Project Status
 
-Kron is **alpha software**. The current public release is `0.1.1`.
+Kron is **alpha software**. The current public release line is `0.1.x`.
 
 The primary product today is **embedded Python scheduling** backed by the Rust
 core. That path is the most mature part of the project and is suitable for
