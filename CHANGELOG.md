@@ -4,7 +4,7 @@ All notable changes to Kron will be documented in this file.
 
 Kron follows semantic versioning after the first stable release. During `0.1.x`, storage and distributed-mode APIs are still allowed to change.
 
-## 0.1.0-alpha.1 - Unreleased
+## 0.1.1-alpha.1 - Unreleased
 
 ### Added
 

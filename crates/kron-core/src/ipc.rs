@@ -57,6 +57,7 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
 pub fn start_server(engine: Arc<Engine>) -> Result<std::thread::JoinHandle<()>, KronError> {
     prepare_ipc_files(engine.data_dir())?;
     let token = read_or_create_token(engine.data_dir())?;
+    let tcp = start_tcp_server(Arc::clone(&engine), token.clone())?;
 
     #[cfg(unix)]
     {
@@ -68,7 +69,6 @@ pub fn start_server(engine: Arc<Engine>) -> Result<std::thread::JoinHandle<()>, 
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
-        let tcp = start_tcp_server(Arc::clone(&engine), token.clone())?;
 
         Ok(std::thread::spawn(move || {
             let _tcp = tcp;

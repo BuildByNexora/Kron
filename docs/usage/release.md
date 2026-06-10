@@ -49,10 +49,10 @@ Or through GitHub Actions:
 4. Create and push a version tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
-5. Run the `Publish` workflow manually and pass `v0.1.0`.
+5. Run the `Publish` workflow manually and pass `v0.1.1`.
 
 After publishing, create a GitHub release with the same version tag and note that distributed mode is experimental.

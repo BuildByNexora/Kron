@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kron-scheduler"
-version = "0.1.0"
+version = "0.1.1"
 description = "Embedded-first runtime for reliable application scheduling"
 readme = "README.md"
 requires-python = ">=3.8"
