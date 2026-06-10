@@ -18,6 +18,22 @@ Kron makes time observable, persistent, and coordinated.
 
 ---
 
+## Why I Built Kron
+
+I was tired of adding Redis just to run a background job every 30 minutes.
+
+System cron is blind. It fires and forgets. Celery works, but you need Redis, a
+broker, and a worker stack just to send an email every morning. Cloud schedulers
+add vendor lock-in and require a reachable endpoint.
+
+So I built Kron.
+
+Embedded, durable, observable.
+
+No broker. No daemon. Just your Python process and a local directory.
+
+---
+
 ## Overview
 
 Kron is a Rust-powered scheduling runtime with Python bindings.
