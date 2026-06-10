@@ -2,6 +2,12 @@
 
 Embedded Python is the primary Kron API for `0.1.x`.
 
+Install the PyPI package as `kron-scheduler`; import it as `kron`:
+
+```bash
+pip install kron-scheduler
+```
+
 ```python
 from datetime import datetime, timedelta, timezone
 import kron
@@ -46,6 +52,22 @@ The v0.1 context is intentionally small. Future versions may add attempt metadat
 - `kron.shutdown(timeout=5.0)` is safe to call even when the runtime is not started.
 - `kron.status(name)` returns a dictionary or `None`.
 - `kron.list()` returns a list of timer dictionaries.
+
+## Asyncio Wrapper
+
+Kron also exposes async wrappers for applications that already run an asyncio
+event loop:
+
+```python
+await kron.astart(data_dir=".kron")
+status = await kron.astatus("email_digest")
+timers = await kron.alist()
+await kron.ashutdown(timeout=5.0)
+```
+
+These functions run the synchronous Kron API in a thread so they do not block
+the event loop. Timer callbacks are still synchronous in `0.1.x`; native async
+callbacks are a later feature.
 
 ## Safety
 

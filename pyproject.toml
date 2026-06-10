@@ -3,7 +3,7 @@ requires = ["maturin>=1.5,<2"]
 build-backend = "maturin"
 
 [project]
-name = "kron"
+name = "kron-scheduler"
 version = "0.1.0"
 description = "Embedded-first runtime for reliable application scheduling"
 readme = "README.md"

@@ -2,6 +2,9 @@
 
 Kron `0.1.x` releases are embedded-first alpha releases.
 
+The PyPI distribution name is `kron-scheduler`; the Python module name remains
+`kron`.
+
 ## Local Verification
 
 ```bash
@@ -39,16 +42,17 @@ Publishing can be done locally:
 
 Or through GitHub Actions:
 
-1. Create a GitHub environment named `pypi`.
-2. Configure PyPI Trusted Publishing for `BuildByNexora/Kron`, workflow
+1. Create the PyPI project `kron-scheduler`.
+2. Create a GitHub environment named `pypi`.
+3. Configure PyPI Trusted Publishing for `BuildByNexora/Kron`, workflow
    `.github/workflows/publish.yml`, environment `pypi`.
-3. Create and push a version tag:
+4. Create and push a version tag:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-4. Run the `Publish` workflow manually and pass `v0.1.0`.
+5. Run the `Publish` workflow manually and pass `v0.1.0`.
 
 After publishing, create a GitHub release with the same version tag and note that distributed mode is experimental.

@@ -102,7 +102,7 @@ Not recommended yet:
 | Data directory locking | Works | Prevents two local writers |
 | Python `Client`/`Worker` server API | Experimental | For serializable task payloads |
 | OpenRaft server mode | Experimental | See [distributed readiness](docs/design/distributed-production-readiness.md) |
-| Async Python API | Not yet | Planned after v0.1 |
+| Async Python wrapper | Works | `await kron.astart()`, sync callbacks only |
 | PyPI release | Ready to publish | Manual/Trusted Publishing workflow prepared |
 
 ---
@@ -132,10 +132,11 @@ Kron aims for the missing middle:
 ## Install
 
 ```bash
-pip install kron
+pip install kron-scheduler
 ```
 
-> Kron is currently alpha. Until the package is published on PyPI, use the local development flow below.
+> The package name is `kron-scheduler` because `kron` is already occupied on PyPI.
+> The Python import remains `import kron`.
 
 ```bash
 python -m venv .venv
@@ -187,6 +188,11 @@ kron.start(data_dir=".kron")
 kron.status(name)
 kron.list()
 kron.shutdown(timeout=5.0)
+
+await kron.astart(data_dir=".kron")
+await kron.astatus(name)
+await kron.alist()
+await kron.ashutdown(timeout=5.0)
 ```
 
 Callbacks can accept no arguments, or one context dictionary:
@@ -352,6 +358,7 @@ Working today:
 - local IPC with token auth;
 - Python callback execution and retry;
 - Python callback context with `timer_id` and `run_id`;
+- Python asyncio wrapper API for non-blocking use in async apps;
 - local crash recovery for persisted timer metadata;
 - wheel build and clean wheel import checks;
 - experimental OpenRaft-backed server mode;
@@ -386,7 +393,7 @@ Still not mature enough for enterprise production:
 - Raft storage is segmented and crash-tested at unit level, but not yet a long-running enterprise log store;
 - no stable storage compatibility promise yet;
 - no native TLS/mTLS yet; use the documented reverse-proxy or service-mesh deployment model;
-- no async Python API yet;
+- async Python callbacks are not supported yet;
 - PyPI publication still requires running the release workflow with a real PyPI project;
 
 Current honest claim:

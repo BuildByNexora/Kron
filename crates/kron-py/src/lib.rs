@@ -232,6 +232,18 @@ fn start(py: Python<'_>, data_dir: Option<String>) -> PyResult<()> {
     }
 }
 
+#[pyfunction(signature = (data_dir=None))]
+fn astart(py: Python<'_>, data_dir: Option<String>) -> PyResult<PyObject> {
+    let asyncio = py.import_bound("asyncio")?;
+    let kron = py.import_bound("kron")?;
+    let start_fn = kron.getattr("start")?;
+    let coroutine = match data_dir {
+        Some(data_dir) => asyncio.getattr("to_thread")?.call1((start_fn, data_dir))?,
+        None => asyncio.getattr("to_thread")?.call1((start_fn,))?,
+    };
+    Ok(coroutine.unbind().into())
+}
+
 #[pyfunction(signature = (timeout=5.0))]
 fn shutdown(py: Python<'_>, timeout: f64) -> PyResult<()> {
     let runtime = {
@@ -277,6 +289,17 @@ fn shutdown(py: Python<'_>, timeout: f64) -> PyResult<()> {
     Ok(())
 }
 
+#[pyfunction(signature = (timeout=5.0))]
+fn ashutdown(py: Python<'_>, timeout: f64) -> PyResult<PyObject> {
+    let asyncio = py.import_bound("asyncio")?;
+    let kron = py.import_bound("kron")?;
+    let shutdown_fn = kron.getattr("shutdown")?;
+    let coroutine = asyncio
+        .getattr("to_thread")?
+        .call1((shutdown_fn, timeout))?;
+    Ok(coroutine.unbind().into())
+}
+
 #[pyfunction]
 fn status(py: Python<'_>, name: String) -> PyResult<Option<PyObject>> {
     let state = global()
@@ -293,6 +316,15 @@ fn status(py: Python<'_>, name: String) -> PyResult<Option<PyObject>> {
 }
 
 #[pyfunction]
+fn astatus(py: Python<'_>, name: String) -> PyResult<PyObject> {
+    let asyncio = py.import_bound("asyncio")?;
+    let kron = py.import_bound("kron")?;
+    let status_fn = kron.getattr("status")?;
+    let coroutine = asyncio.getattr("to_thread")?.call1((status_fn, name))?;
+    Ok(coroutine.unbind().into())
+}
+
+#[pyfunction]
 fn list(py: Python<'_>) -> PyResult<Vec<PyObject>> {
     let state = global()
         .lock()
@@ -306,6 +338,15 @@ fn list(py: Python<'_>) -> PyResult<Vec<PyObject>> {
         .into_iter()
         .map(|summary| summary_to_dict(py, summary))
         .collect()
+}
+
+#[pyfunction]
+fn alist(py: Python<'_>) -> PyResult<PyObject> {
+    let asyncio = py.import_bound("asyncio")?;
+    let kron = py.import_bound("kron")?;
+    let list_fn = kron.getattr("list")?;
+    let coroutine = asyncio.getattr("to_thread")?.call1((list_fn,))?;
+    Ok(coroutine.unbind().into())
 }
 
 #[pyclass]
@@ -581,9 +622,13 @@ impl PyTaskDecorator {
 fn kron(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(schedule, m)?)?;
     m.add_function(wrap_pyfunction!(start, m)?)?;
+    m.add_function(wrap_pyfunction!(astart, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown, m)?)?;
+    m.add_function(wrap_pyfunction!(ashutdown, m)?)?;
     m.add_function(wrap_pyfunction!(status, m)?)?;
+    m.add_function(wrap_pyfunction!(astatus, m)?)?;
     m.add_function(wrap_pyfunction!(list, m)?)?;
+    m.add_function(wrap_pyfunction!(alist, m)?)?;
     m.add_class::<Client>()?;
     m.add_class::<Worker>()?;
     Ok(())
