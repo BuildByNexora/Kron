@@ -9,6 +9,8 @@ Kron makes time observable, persistent, and coordinated.
 
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
 [![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#project-status)
+[![CI](https://github.com/BuildByNexora/Kron/actions/workflows/ci.yml/badge.svg)](https://github.com/BuildByNexora/Kron/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/kron-scheduler.svg)](https://pypi.org/project/kron-scheduler/)
 [![Rust](https://img.shields.io/badge/Rust-core-black.svg)](crates/kron-core)
 [![Python](https://img.shields.io/badge/Python-bindings-blue.svg)](crates/kron-py)
 
@@ -103,7 +105,8 @@ Not recommended yet:
 | Python `Client`/`Worker` server API | Experimental | For serializable task payloads |
 | OpenRaft server mode | Experimental | See [distributed readiness](docs/design/distributed-production-readiness.md) |
 | Async Python wrapper | Works | `await kron.astart()`, sync callbacks only |
-| PyPI release | Ready to publish | Manual/Trusted Publishing workflow prepared |
+| PyPI release | Published | Package: `kron-scheduler`, import: `kron` |
+| CI matrix | Passing | Rust, Python, and wheel checks on Linux/macOS/Windows |
 
 ---
 
@@ -338,7 +341,7 @@ X-Kron-Fencing-Token: 42
 
 ## Project Status
 
-Kron is **alpha software** moving toward a credible `v0.1`.
+Kron is **alpha software**. The current public release is `0.1.1`.
 
 The primary product today is **embedded Python scheduling** backed by the Rust
 core. That path is the most mature part of the project and is suitable for
@@ -349,6 +352,7 @@ Working today:
 
 - Rust core engine;
 - Python embedded API with PyO3;
+- published PyPI package: `kron-scheduler`;
 - non-blocking `kron.start()`;
 - controlled shutdown;
 - data directory locking;
@@ -360,7 +364,8 @@ Working today:
 - Python callback context with `timer_id` and `run_id`;
 - Python asyncio wrapper API for non-blocking use in async apps;
 - local crash recovery for persisted timer metadata;
-- wheel build and clean wheel import checks;
+- wheel build and clean wheel import checks on Linux, macOS, and Windows;
+- GitHub Actions CI for Rust, Python 3.8-3.12, and wheel artifacts;
 - experimental OpenRaft-backed server mode;
 - Python `Client` and `Worker` APIs for server mode;
 - single-node distributed client/worker roundtrip test;
@@ -394,13 +399,12 @@ Still not mature enough for enterprise production:
 - no stable storage compatibility promise yet;
 - no native TLS/mTLS yet; use the documented reverse-proxy or service-mesh deployment model;
 - async Python callbacks are not supported yet;
-- PyPI publication still requires running the release workflow with a real PyPI project;
 
 Current honest claim:
 
-> Kron embedded mode is the primary alpha product. Distributed mode is an
-> OpenRaft-backed experimental server with early 3-node validation, not yet an
-> enterprise production scheduler.
+> Kron embedded mode is the primary alpha product and is published on PyPI as
+> `kron-scheduler`. Distributed mode is an OpenRaft-backed experimental server
+> with early 3-node validation, not yet an enterprise production scheduler.
 
 ---
 
