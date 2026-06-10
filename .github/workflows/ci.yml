@@ -18,6 +18,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test
@@ -34,9 +37,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -U pip maturin pytest
-      - run: maturin develop
-      - run: python -m pytest -q tests/python
+      - name: Create virtualenv
+        run: python -m venv .venv
+      - name: Install Python build tools
+        run: .venv/bin/python -m pip install -U pip maturin pytest
+        if: runner.os != 'Windows'
+      - name: Install Python build tools
+        run: .venv\Scripts\python -m pip install -U pip maturin pytest
+        if: runner.os == 'Windows'
+      - name: Install Kron into virtualenv
+        run: .venv/bin/maturin develop
+        if: runner.os != 'Windows'
+      - name: Install Kron into virtualenv
+        run: .venv\Scripts\maturin develop
+        if: runner.os == 'Windows'
+      - name: Run Python tests
+        run: .venv/bin/python -m pytest -q tests/python
+        if: runner.os != 'Windows'
+      - name: Run Python tests
+        run: .venv\Scripts\python -m pytest -q tests/python
+        if: runner.os == 'Windows'
 
   wheels:
     runs-on: ${{ matrix.os }}
