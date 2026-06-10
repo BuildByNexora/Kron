@@ -970,11 +970,19 @@ fn segment_file_name(first: u64, last: u64) -> String {
 }
 
 fn sync_dir(path: &Path) -> StoreResult<()> {
-    let dir = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(read_error)?;
-    dir.sync_all().map_err(write_error)
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let dir = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(read_error)?;
+        dir.sync_all().map_err(write_error)
+    }
 }
 
 fn corrupt_store(message: &str) -> StorageError<u64> {
