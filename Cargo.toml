@@ -24,3 +24,4 @@ criterion  = "0.5"
 openraft   = { version = "=0.9.24", features = ["serde", "storage-v2"] }
 axum       = "0.7"
 reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+getrandom  = "0.2"

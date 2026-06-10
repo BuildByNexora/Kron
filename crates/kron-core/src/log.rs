@@ -24,6 +24,16 @@ impl AppendOnlyLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)?
+        };
+        #[cfg(not(unix))]
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self { path, file })
     }

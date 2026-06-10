@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
@@ -22,6 +24,10 @@ use crate::timer::{RunId, TimerId, TimerState};
 
 type StoreResult<T> = Result<T, StorageError<u64>>;
 type KronEntry = openraft::Entry<KronTypeConfig>;
+const STORE_FORMAT_VERSION: u32 = 1;
+const LOG_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const LOG_RECORD_MAGIC: &[u8; 8] = b"KRLOG001";
+const LOG_RECORD_HEADER_BYTES: usize = 8 + 4 + 8 + 8 + 4 + 8;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedRaftStore {
@@ -29,6 +35,26 @@ struct PersistedRaftStore {
     committed: Option<LogId<u64>>,
     last_purged_log_id: Option<LogId<u64>>,
     logs: BTreeMap<u64, KronEntry>,
+    state_machine: PersistedStateMachine,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Manifest {
+    format_version: u32,
+    active_snapshot: Option<String>,
+    last_purged_log_id: Option<LogId<u64>>,
+    segments: Vec<SegmentMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentMeta {
+    first_index: u64,
+    last_index: u64,
+    file: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StoreState {
     state_machine: PersistedStateMachine,
 }
 
@@ -93,7 +119,7 @@ impl Default for PersistedStateMachine {
 
 #[derive(Clone)]
 pub struct KronRaftFileStore {
-    path: PathBuf,
+    raft_dir: PathBuf,
     inner: Arc<Mutex<PersistedRaftStore>>,
 }
 
@@ -102,21 +128,43 @@ impl KronRaftFileStore {
     pub fn open(data_dir: impl AsRef<Path>) -> StoreResult<Self> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir).map_err(write_error)?;
-        let path = data_dir.join("kron.openraft.store.json");
-        let inner = if path.exists() {
-            let mut content = String::new();
-            File::open(&path)
-                .map_err(read_error)?
-                .read_to_string(&mut content)
-                .map_err(read_error)?;
-            serde_json::from_str(&content).map_err(|err| {
-                StorageError::from_io_error(ErrorSubject::Store, ErrorVerb::Read, json_io(err))
-            })?
-        } else {
-            PersistedRaftStore::default()
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(write_error)?;
+        }
+        if data_dir.join("kron.openraft.store.json").exists() {
+            return Err(StorageError::from_io_error(
+                ErrorSubject::Store,
+                ErrorVerb::Read,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "alpha JSON Raft storage requires manual migration",
+                ),
+            ));
+        }
+        let raft_dir = data_dir.join("raft");
+        std::fs::create_dir_all(raft_dir.join("log")).map_err(write_error)?;
+        std::fs::create_dir_all(raft_dir.join("snapshots")).map_err(write_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&raft_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(write_error)?;
+        }
+        let manifest = read_manifest(&raft_dir)?;
+        let logs = read_log_segments(&raft_dir, &manifest)?;
+        let state_machine = read_state(&raft_dir)?;
+        let inner = PersistedRaftStore {
+            vote: read_json_optional(&raft_dir.join("vote.json"))?,
+            committed: read_json_optional(&raft_dir.join("committed.json"))?,
+            last_purged_log_id: manifest.last_purged_log_id,
+            logs,
+            state_machine,
         };
         Ok(Self {
-            path,
+            raft_dir,
             inner: Arc::new(Mutex::new(inner)),
         })
     }
@@ -170,20 +218,16 @@ impl KronRaftFileStore {
 
     #[allow(clippy::result_large_err)]
     fn persist(&self, inner: &PersistedRaftStore) -> StoreResult<()> {
-        let tmp = self.path.with_extension("json.tmp");
-        let mut file = File::create(&tmp).map_err(write_error)?;
-        let encoded = serde_json::to_vec_pretty(inner).map_err(|err| {
-            StorageError::from_io_error(ErrorSubject::Store, ErrorVerb::Write, json_io(err))
-        })?;
-        file.write_all(&encoded).map_err(write_error)?;
-        file.write_all(b"\n").map_err(write_error)?;
-        file.sync_all().map_err(write_error)?;
-        std::fs::rename(&tmp, &self.path).map_err(write_error)?;
-        if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = OpenOptions::new().read(true).open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        write_json_atomic(&self.raft_dir.join("vote.json"), &inner.vote)?;
+        write_json_atomic(&self.raft_dir.join("committed.json"), &inner.committed)?;
+        write_json_atomic(
+            &self.raft_dir.join("state.json"),
+            &StoreState {
+                state_machine: inner.state_machine.clone(),
+            },
+        )?;
+        rewrite_log_segments(&self.raft_dir, &inner.logs, inner.last_purged_log_id)?;
+        sync_dir(&self.raft_dir)?;
         Ok(())
     }
 
@@ -479,9 +523,21 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
         RaftCommand::CompleteRun {
             run_id,
             worker_id,
+            fencing_token,
             completed_at,
         } => {
-            if let Some(active) = state.active_runs.remove(&run_id.0) {
+            let valid = state
+                .active_runs
+                .get(&run_id.0)
+                .map(|active| {
+                    active.worker_id == worker_id && active.fencing_token == fencing_token
+                })
+                .unwrap_or(false);
+            if valid {
+                let active = state
+                    .active_runs
+                    .remove(&run_id.0)
+                    .expect("active run checked");
                 set_state(state, &active.timer_id, TimerState::Scheduled);
                 reschedule_timer(state, &active.timer_id, completed_at);
                 state.history.push(serde_json::json!({
@@ -496,10 +552,22 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
         RaftCommand::FailRun {
             run_id,
             worker_id,
+            fencing_token,
             error,
             failed_at: _,
         } => {
-            if let Some(active) = state.active_runs.remove(&run_id.0) {
+            let valid = state
+                .active_runs
+                .get(&run_id.0)
+                .map(|active| {
+                    active.worker_id == worker_id && active.fencing_token == fencing_token
+                })
+                .unwrap_or(false);
+            if valid {
+                let active = state
+                    .active_runs
+                    .remove(&run_id.0)
+                    .expect("active run checked");
                 set_state(state, &active.timer_id, TimerState::Dead);
                 state.history.push(serde_json::json!({
                     "type": "RUN_FAILED",
@@ -593,6 +661,328 @@ fn reschedule_timer(
             }
         }
     }
+}
+
+fn read_manifest(raft_dir: &Path) -> StoreResult<Manifest> {
+    let path = raft_dir.join("manifest.json");
+    if !path.exists() {
+        let manifest = Manifest {
+            format_version: STORE_FORMAT_VERSION,
+            active_snapshot: None,
+            last_purged_log_id: None,
+            segments: Vec::new(),
+        };
+        write_json_atomic(&path, &manifest)?;
+        return Ok(manifest);
+    }
+    let manifest: Manifest = read_json(&path)?;
+    if manifest.format_version != STORE_FORMAT_VERSION {
+        return Err(StorageError::from_io_error(
+            ErrorSubject::Store,
+            ErrorVerb::Read,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported raft storage format version {}",
+                    manifest.format_version
+                ),
+            ),
+        ));
+    }
+    Ok(manifest)
+}
+
+fn read_state(raft_dir: &Path) -> StoreResult<PersistedStateMachine> {
+    let path = raft_dir.join("state.json");
+    if !path.exists() {
+        return Ok(PersistedStateMachine::default());
+    }
+    let state: StoreState = read_json(&path)?;
+    Ok(state.state_machine)
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> StoreResult<T> {
+    let mut content = String::new();
+    File::open(path)
+        .map_err(read_error)?
+        .read_to_string(&mut content)
+        .map_err(read_error)?;
+    serde_json::from_str(&content).map_err(|err| {
+        StorageError::from_io_error(ErrorSubject::Store, ErrorVerb::Read, json_io(err))
+    })
+}
+
+fn read_json_optional<T: serde::de::DeserializeOwned>(path: &Path) -> StoreResult<Option<T>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_json(path)
+}
+
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> StoreResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(write_error)?;
+    }
+    let tmp = path.with_extension("tmp");
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(write_error)?
+    };
+    #[cfg(not(unix))]
+    let mut file = File::create(&tmp).map_err(write_error)?;
+    serde_json::to_writer_pretty(&mut file, value).map_err(|err| {
+        StorageError::from_io_error(ErrorSubject::Store, ErrorVerb::Write, json_io(err))
+    })?;
+    file.write_all(b"\n").map_err(write_error)?;
+    file.sync_all().map_err(write_error)?;
+    std::fs::rename(&tmp, path).map_err(write_error)?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn read_log_segments(
+    raft_dir: &Path,
+    manifest: &Manifest,
+) -> StoreResult<BTreeMap<u64, KronEntry>> {
+    let mut logs = BTreeMap::new();
+    for segment in &manifest.segments {
+        let path = raft_dir.join("log").join(&segment.file);
+        if !path.exists() {
+            return Err(StorageError::from_io_error(
+                ErrorSubject::Store,
+                ErrorVerb::Read,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("missing raft log segment {}", path.display()),
+                ),
+            ));
+        }
+        let segment_logs = read_segment_file(&path)?;
+        for entry in segment_logs {
+            logs.insert(entry.log_id.index, entry);
+        }
+    }
+    Ok(logs)
+}
+
+fn read_segment_file(path: &Path) -> StoreResult<Vec<KronEntry>> {
+    let mut file = File::open(path).map_err(read_error)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(read_error)?;
+    let mut offset = 0usize;
+    let mut entries = Vec::new();
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        if remaining < LOG_RECORD_HEADER_BYTES {
+            if entries.is_empty() {
+                return Err(corrupt_store("truncated raft log record header"));
+            }
+            break;
+        }
+        let start = offset;
+        let magic = &bytes[offset..offset + 8];
+        offset += 8;
+        if magic != LOG_RECORD_MAGIC {
+            return Err(corrupt_store("invalid raft log record magic"));
+        }
+        let version = read_u32(&bytes, &mut offset)?;
+        if version != STORE_FORMAT_VERSION {
+            return Err(corrupt_store("unsupported raft log record version"));
+        }
+        let term = read_u64(&bytes, &mut offset)?;
+        let index = read_u64(&bytes, &mut offset)?;
+        let checksum = read_u32(&bytes, &mut offset)?;
+        let len = read_u64(&bytes, &mut offset)? as usize;
+        if bytes.len().saturating_sub(offset) < len {
+            if entries.is_empty() {
+                return Err(corrupt_store("truncated raft log record payload"));
+            }
+            break;
+        }
+        let payload = &bytes[offset..offset + len];
+        offset += len;
+        if checksum32(payload) != checksum {
+            return Err(corrupt_store("raft log record checksum mismatch"));
+        }
+        let entry: KronEntry = serde_json::from_slice(payload).map_err(|err| {
+            StorageError::from_io_error(ErrorSubject::Store, ErrorVerb::Read, json_io(err))
+        })?;
+        if entry.log_id.index != index || entry.log_id.leader_id.term != term {
+            return Err(corrupt_store("raft log record header does not match entry"));
+        }
+        if start == offset {
+            return Err(corrupt_store("empty raft log record"));
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn rewrite_log_segments(
+    raft_dir: &Path,
+    logs: &BTreeMap<u64, KronEntry>,
+    last_purged_log_id: Option<LogId<u64>>,
+) -> StoreResult<()> {
+    let log_dir = raft_dir.join("log");
+    std::fs::create_dir_all(&log_dir).map_err(write_error)?;
+    for entry in std::fs::read_dir(&log_dir).map_err(read_error)? {
+        let path = entry.map_err(read_error)?.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("seg") {
+            std::fs::remove_file(path).map_err(write_error)?;
+        }
+    }
+    let mut manifest = Manifest {
+        format_version: STORE_FORMAT_VERSION,
+        active_snapshot: None,
+        last_purged_log_id,
+        segments: Vec::new(),
+    };
+    let mut current_file: Option<File> = None;
+    let mut current_first = 0u64;
+    let mut current_last = 0u64;
+    let mut current_size = 0u64;
+    for entry in logs.values() {
+        if current_file.is_none() || current_size >= LOG_SEGMENT_MAX_BYTES {
+            if let Some(file) = current_file.take() {
+                file.sync_all().map_err(write_error)?;
+                let old = log_dir.join(segment_file_name(current_first, current_first));
+                let final_name = segment_file_name(current_first, current_last);
+                let final_path = log_dir.join(&final_name);
+                if old != final_path {
+                    std::fs::rename(old, &final_path).map_err(write_error)?;
+                }
+                manifest.segments.push(SegmentMeta {
+                    first_index: current_first,
+                    last_index: current_last,
+                    file: final_name,
+                });
+            }
+            current_first = entry.log_id.index;
+            current_size = 0;
+            current_file = Some(open_segment_file(
+                &log_dir.join(segment_file_name(current_first, current_first)),
+            )?);
+        }
+        current_last = entry.log_id.index;
+        let encoded = encode_log_record(entry)?;
+        if let Some(file) = current_file.as_mut() {
+            file.write_all(&encoded).map_err(write_error)?;
+        }
+        current_size += encoded.len() as u64;
+    }
+    if let Some(file) = current_file.take() {
+        file.sync_all().map_err(write_error)?;
+        let old = log_dir.join(segment_file_name(current_first, current_first));
+        let final_name = segment_file_name(current_first, current_last);
+        let final_path = log_dir.join(&final_name);
+        if old != final_path {
+            std::fs::rename(old, &final_path).map_err(write_error)?;
+        }
+        manifest.segments.push(SegmentMeta {
+            first_index: current_first,
+            last_index: current_last,
+            file: final_name,
+        });
+    }
+    write_json_atomic(&raft_dir.join("manifest.json"), &manifest)?;
+    sync_dir(&log_dir)?;
+    Ok(())
+}
+
+fn open_segment_file(path: &Path) -> StoreResult<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(write_error)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(write_error)
+    }
+}
+
+fn encode_log_record(entry: &KronEntry) -> StoreResult<Vec<u8>> {
+    let payload = serde_json::to_vec(entry).map_err(|err| {
+        StorageError::from_io_error(ErrorSubject::Store, ErrorVerb::Write, json_io(err))
+    })?;
+    let mut out = Vec::with_capacity(LOG_RECORD_HEADER_BYTES + payload.len());
+    out.extend_from_slice(LOG_RECORD_MAGIC);
+    out.extend_from_slice(&STORE_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&entry.log_id.leader_id.term.to_le_bytes());
+    out.extend_from_slice(&entry.log_id.index.to_le_bytes());
+    out.extend_from_slice(&checksum32(&payload).to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+fn read_u32(bytes: &[u8], offset: &mut usize) -> StoreResult<u32> {
+    if bytes.len().saturating_sub(*offset) < 4 {
+        return Err(corrupt_store("truncated u32"));
+    }
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(&bytes[*offset..*offset + 4]);
+    *offset += 4;
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn read_u64(bytes: &[u8], offset: &mut usize) -> StoreResult<u64> {
+    if bytes.len().saturating_sub(*offset) < 8 {
+        return Err(corrupt_store("truncated u64"));
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[*offset..*offset + 8]);
+    *offset += 8;
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn checksum32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in bytes {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+fn segment_file_name(first: u64, last: u64) -> String {
+    format!("{first:016x}-{last:016x}.seg")
+}
+
+fn sync_dir(path: &Path) -> StoreResult<()> {
+    let dir = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(read_error)?;
+    dir.sync_all().map_err(write_error)
+}
+
+fn corrupt_store(message: &str) -> StorageError<u64> {
+    StorageError::from_io_error(
+        ErrorSubject::Store,
+        ErrorVerb::Read,
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string()),
+    )
 }
 
 fn contains<RB: RangeBounds<u64>>(range: &RB, value: u64) -> bool {
@@ -790,5 +1180,99 @@ mod tests {
         let log_state = reopened.get_log_state().await.unwrap();
         assert_eq!(log_state.last_purged_log_id, Some(log_id(1)));
         assert_eq!(log_state.last_log_id, Some(log_id(2)));
+    }
+
+    #[tokio::test]
+    async fn segmented_store_writes_manifest_and_segments() {
+        let dir = tempdir().unwrap();
+        let store = KronRaftFileStore::open(dir.path()).unwrap();
+
+        store
+            .append_for_test([create_timer_entry(1, "one"), create_timer_entry(2, "two")])
+            .unwrap();
+
+        let manifest_path = dir.path().join("raft").join("manifest.json");
+        let manifest: Manifest = read_json(&manifest_path).unwrap();
+        assert_eq!(manifest.format_version, STORE_FORMAT_VERSION);
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(manifest.segments[0].first_index, 1);
+        assert_eq!(manifest.segments[0].last_index, 2);
+        assert!(dir
+            .path()
+            .join("raft")
+            .join("log")
+            .join(&manifest.segments[0].file)
+            .exists());
+    }
+
+    #[test]
+    fn open_rejects_legacy_json_raft_store() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("kron.openraft.store.json"), "{}").unwrap();
+
+        let err = match KronRaftFileStore::open(dir.path()) {
+            Ok(_) => panic!("legacy JSON store should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("alpha JSON Raft storage requires manual migration"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_middle_segment_record_fails_loudly() {
+        let dir = tempdir().unwrap();
+        let store = KronRaftFileStore::open(dir.path()).unwrap();
+        store
+            .append_for_test([create_timer_entry(1, "one"), create_timer_entry(2, "two")])
+            .unwrap();
+
+        let manifest: Manifest = read_json(&dir.path().join("raft").join("manifest.json")).unwrap();
+        let path = dir
+            .path()
+            .join("raft")
+            .join("log")
+            .join(&manifest.segments[0].file);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first_record_len = {
+            let mut offset = 8 + 4 + 8 + 8 + 4;
+            read_u64(&bytes, &mut offset).unwrap() as usize + LOG_RECORD_HEADER_BYTES
+        };
+        bytes[first_record_len + 2] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = match KronRaftFileStore::open(dir.path()) {
+            Ok(_) => panic!("corrupt segment should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("magic")
+                || err.to_string().contains("checksum")
+                || err.to_string().contains("header")
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_final_segment_tail_is_ignored_deterministically() {
+        let dir = tempdir().unwrap();
+        let store = KronRaftFileStore::open(dir.path()).unwrap();
+        store
+            .append_for_test([create_timer_entry(1, "one"), create_timer_entry(2, "two")])
+            .unwrap();
+
+        let manifest: Manifest = read_json(&dir.path().join("raft").join("manifest.json")).unwrap();
+        let path = dir
+            .path()
+            .join("raft")
+            .join("log")
+            .join(&manifest.segments[0].file);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 10);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reopened = KronRaftFileStore::open(dir.path()).unwrap();
+        let entries = reopened.try_get_log_entries(..).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id, log_id(1));
     }
 }

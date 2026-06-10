@@ -162,11 +162,13 @@ pub enum RaftCommand {
     CompleteRun {
         run_id: RunId,
         worker_id: String,
+        fencing_token: u64,
         completed_at: DateTime<Utc>,
     },
     FailRun {
         run_id: RunId,
         worker_id: String,
+        fencing_token: u64,
         error: String,
         failed_at: DateTime<Utc>,
     },
@@ -276,7 +278,24 @@ impl ClusterEngine {
     ) -> Result<Self, KronError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let lock_path = data_dir.join("kron.lock");
+        #[cfg(unix)]
+        let lock_file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)?
+        };
+        #[cfg(not(unix))]
         let lock_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -449,6 +468,7 @@ impl ClusterEngine {
         self.append_command(RaftCommand::CompleteRun {
             run_id: run_id.clone(),
             worker_id: request.worker_id,
+            fencing_token: request.fencing_token,
             completed_at: Utc::now(),
         })?;
         state.active_runs.remove(&run_id);
@@ -479,6 +499,7 @@ impl ClusterEngine {
         self.append_command(RaftCommand::FailRun {
             run_id: run_id.clone(),
             worker_id: request.worker_id,
+            fencing_token: request.fencing_token,
             error: request.error.clone(),
             failed_at: Utc::now(),
         })?;
@@ -873,6 +894,22 @@ pub fn serve_http(engine: Arc<ClusterEngine>, token: String) -> Result<(), KronE
 
 pub fn server_token(data_dir: &Path) -> Result<String, KronError> {
     if let Ok(token) = std::env::var("KRON_CLUSTER_TOKEN") {
+        std::fs::create_dir_all(data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(ipc::token_path(data_dir))?;
+            file.write_all(format!("{token}\n").as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
         std::fs::write(ipc::token_path(data_dir), format!("{token}\n"))?;
         #[cfg(unix)]
         {
@@ -926,6 +963,13 @@ fn handle_http_stream(
             }
         })
         .unwrap_or(0);
+    if content_length > 1024 * 1024 {
+        return write_json(
+            &mut stream,
+            413,
+            serde_json::json!({"error": "request body too large"}),
+        );
+    }
     let mut body = vec![0; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
@@ -935,7 +979,11 @@ fn handle_http_stream(
         let Some((name, value)) = line.split_once(':') else {
             return false;
         };
-        name.eq_ignore_ascii_case("authorization") && value.trim() == format!("Bearer {token}")
+        name.eq_ignore_ascii_case("authorization")
+            && crate::ipc::secure_eq(
+                value.trim().as_bytes(),
+                format!("Bearer {token}").as_bytes(),
+            )
     });
     if !authorized {
         return write_json(
@@ -1179,9 +1227,21 @@ fn apply_command(state: &mut ClusterState, command: &RaftCommand) -> Result<(), 
         RaftCommand::CompleteRun {
             run_id,
             worker_id,
+            fencing_token,
             completed_at: _,
         } => {
-            if let Some(active) = state.active_runs.remove(run_id) {
+            let valid = state
+                .active_runs
+                .get(run_id)
+                .map(|active| {
+                    active.worker_id == *worker_id && active.fencing_token == *fencing_token
+                })
+                .unwrap_or(false);
+            if valid {
+                let active = state
+                    .active_runs
+                    .remove(run_id)
+                    .expect("active run checked");
                 state
                     .states
                     .insert(active.timer_id.clone(), TimerState::Scheduled);
@@ -1199,10 +1259,22 @@ fn apply_command(state: &mut ClusterState, command: &RaftCommand) -> Result<(), 
         RaftCommand::FailRun {
             run_id,
             worker_id,
+            fencing_token,
             error,
             failed_at: _,
         } => {
-            if let Some(active) = state.active_runs.remove(run_id) {
+            let valid = state
+                .active_runs
+                .get(run_id)
+                .map(|active| {
+                    active.worker_id == *worker_id && active.fencing_token == *fencing_token
+                })
+                .unwrap_or(false);
+            if valid {
+                let active = state
+                    .active_runs
+                    .remove(run_id)
+                    .expect("active run checked");
                 state
                     .states
                     .insert(active.timer_id.clone(), TimerState::Dead);

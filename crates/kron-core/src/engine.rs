@@ -113,7 +113,24 @@ impl Engine {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, KronError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let lock_path = data_dir.join("kron.lock");
+        #[cfg(unix)]
+        let lock_file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)?
+        };
+        #[cfg(not(unix))]
         let lock_file = OpenOptions::new()
             .create(true)
             .read(true)

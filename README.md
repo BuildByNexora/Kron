@@ -31,6 +31,82 @@ The server is a deployment mode, not the product.
 
 ---
 
+## What It Does Today
+
+Kron currently provides an embedded Python runtime backed by a Rust engine.
+
+It can:
+
+- register timers from Python callbacks;
+- run timers from `cron`, `every`, `after`, or `at` schedules;
+- start in the background without blocking the Python process;
+- persist timer metadata in a local `.kron/` data directory;
+- recover timer metadata after process restart;
+- mark persisted timers as `orphaned` until their Python function is re-registered;
+- record every run as events in an append-only log;
+- retry failed callbacks with configurable max attempts;
+- expose timer status and history through Python and the CLI;
+- compact the append-only log into a JSON snapshot;
+- prevent two runtimes from writing the same data directory at the same time;
+- let the CLI inspect an active runtime through local IPC.
+
+It also includes an experimental server mode that can:
+
+- run as a standalone process;
+- accept JSON task schedules over HTTP;
+- register Python workers by task name;
+- assign runs to workers;
+- attach fencing tokens to claimed runs;
+- persist server state through an OpenRaft-backed file store.
+
+Server mode is not the recommended production path yet.
+
+---
+
+## Common Use Cases
+
+Kron is useful when an application needs scheduled work but a full job stack is too heavy.
+
+Good v0.1 use cases:
+
+- send periodic email digests from a Python app;
+- clean local or application-owned resources on a schedule;
+- run small maintenance callbacks;
+- retry transient application tasks;
+- keep observable history for scheduled work;
+- replace ad-hoc `while True: sleep(...)` loops;
+- prototype scheduling without Redis, RabbitMQ, Celery, or cloud schedulers.
+
+Not recommended yet:
+
+- critical payment processing;
+- high-volume distributed task queues;
+- multi-tenant hosted scheduling;
+- replacing Temporal, Airflow, Prefect, or a production message broker;
+- depending on stable storage compatibility across alpha releases.
+
+---
+
+## Feature Matrix
+
+| Capability | Status | Notes |
+|---|---:|---|
+| Embedded Python scheduling | Works | Primary v0.1 path |
+| `cron`, `every`, `after`, `at` schedules | Works | Timezone support exists; DST needs continued hardening |
+| Non-blocking `kron.start()` | Works | Runs in a background thread |
+| Persistent timer metadata | Works | Stored under `.kron/` |
+| Append-only event log | Works | NDJSON, fsync on append |
+| Snapshot and compaction | Works | Format is not stable before v1.0 |
+| Retry on callback failure | Works | Max attempts supported |
+| CLI status/list/history | Works | Uses IPC when runtime is active, read-only fallback otherwise |
+| Data directory locking | Works | Prevents two local writers |
+| Python `Client`/`Worker` server API | Experimental | For serializable task payloads |
+| OpenRaft server mode | Experimental | See [distributed readiness](docs/design/distributed-production-readiness.md) |
+| Async Python API | Not yet | Planned after v0.1 |
+| PyPI release | Ready to publish | Manual/Trusted Publishing workflow prepared |
+
+---
+
 ## Why Kron?
 
 Most applications eventually need scheduled work:
@@ -67,6 +143,12 @@ python -m venv .venv
 .venv/bin/maturin develop
 ```
 
+Run an example:
+
+```bash
+.venv/bin/python examples/email_digest.py
+```
+
 ---
 
 ## Quickstart: Embedded Python
@@ -92,6 +174,27 @@ No worker stack.
 No cloud scheduler.
 
 Timers persist in `.kron/`, and every run writes events to an append-only log.
+
+Embedded public API:
+
+```python
+kron.schedule(name, fn=callable, cron="0 8 * * *")
+kron.schedule(name, fn=callable, every="30m")
+kron.schedule(name, fn=callable, after="10s")
+kron.schedule(name, fn=callable, at=datetime_obj)
+
+kron.start(data_dir=".kron")
+kron.status(name)
+kron.list()
+kron.shutdown(timeout=5.0)
+```
+
+Callbacks can accept no arguments, or one context dictionary:
+
+```python
+def task(context):
+    print(context["timer_id"], context["run_id"])
+```
 
 ---
 
@@ -165,9 +268,23 @@ External effects such as emails, payments, webhooks, and database writes must st
 
 ---
 
-## Server Mode
+## Safety
 
-Kron also has an experimental standalone server mode:
+Scheduled functions can perform real side effects: send emails, write databases, call APIs, create cloud resources, or charge users. Treat scheduled callbacks like production code.
+
+- Make callbacks idempotent.
+- Keep external effects guarded by application-level idempotency keys.
+- Test timers with short local schedules before using real schedules.
+- Use embedded mode for v0.1 production experiments.
+- Keep experimental server mode away from critical workloads until the distributed test matrix is stronger.
+
+---
+
+## Experimental Server Mode
+
+The stable path for v0.1 is embedded Python. Kron also includes an experimental standalone server mode for serializable worker tasks.
+
+Do not use server mode for critical production workloads yet. It still needs more 3-node failure testing, leader redirect hardening, and a production-grade Raft storage backend.
 
 ```bash
 kron --data-dir .kron-n1 server start \
@@ -200,7 +317,7 @@ def send_digest(payload):
 worker.run()
 ```
 
-Distributed mode uses OpenRaft for committed state, leader election, log replication, and membership.
+Distributed mode uses OpenRaft for committed state, leader election, log replication, and membership. The current file-backed Raft store is intended for alpha testing, not long-term production storage.
 
 Every claimed run has:
 
@@ -215,7 +332,12 @@ X-Kron-Fencing-Token: 42
 
 ## Project Status
 
-Kron is **alpha software**.
+Kron is **alpha software** moving toward a credible `v0.1`.
+
+The primary product today is **embedded Python scheduling** backed by the Rust
+core. That path is the most mature part of the project and is suitable for
+experimentation, local tools, small services, and early adopters who can accept
+alpha storage compatibility.
 
 Working today:
 
@@ -229,25 +351,55 @@ Working today:
 - CLI observe/admin commands;
 - local IPC with token auth;
 - Python callback execution and retry;
+- Python callback context with `timer_id` and `run_id`;
+- local crash recovery for persisted timer metadata;
+- wheel build and clean wheel import checks;
 - experimental OpenRaft-backed server mode;
 - Python `Client` and `Worker` APIs for server mode;
+- single-node distributed client/worker roundtrip test;
+- 3-node distributed smoke test covering join, timer replication, and follower write rejection;
+- 3-node leader failover test covering leader kill, new leader election, and writes after failover;
+- worker recovery test covering abandoned run reclaim after leader kill and lease expiry;
+- majority-continuation test after follower loss;
+- stale completion rejection tests after lease expiry and after a replacement worker succeeds;
+- segmented OpenRaft storage tests for reopen, purge, truncate, legacy-store rejection, corrupted records, and truncated final records;
 - BSD 3-Clause license.
 
-Still not mature:
+Distributed mode status:
 
-- distributed mode needs more real 3-node failure tests;
-- client/CLI leader redirect is still basic;
-- Raft storage is file JSON, not a production log segment store;
+- uses OpenRaft for committed state, leader election, log replication, and membership;
+- has token-authenticated public and internal Raft HTTP endpoints;
+- supports serializable worker tasks and JSON payloads;
+- has fencing tokens for claimed runs;
+- has a real 3-node subprocess smoke test;
+- has a real leader-kill failover test;
+- has a worker recovery test after leader kill and lease expiry;
+- has a majority-continuation test after follower loss;
+- rejects stale worker completions with committed fencing validation;
+- uses a segmented file-backed OpenRaft store with manifest, checksummed log records, and deterministic tail-truncation handling;
+- remains **experimental**, not production-ready.
+
+Still not mature enough for enterprise production:
+
+- full network partition tests are still missing;
+- client/CLI/worker leader redirect is still basic;
+- Raft storage is segmented and crash-tested at unit level, but not yet a long-running enterprise log store;
 - no stable storage compatibility promise yet;
+- no native TLS/mTLS yet; use the documented reverse-proxy or service-mesh deployment model;
 - no async Python API yet;
-- no published PyPI release yet;
-- no security hardening beyond local token auth.
+- PyPI publication still requires running the release workflow with a real PyPI project;
 
-This is a serious prototype moving toward pre-alpha release quality, not a finished 1.0 system.
+Current honest claim:
+
+> Kron embedded mode is the primary alpha product. Distributed mode is an
+> OpenRaft-backed experimental server with early 3-node validation, not yet an
+> enterprise production scheduler.
 
 ---
 
 ## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
 Run Rust tests:
 
@@ -274,6 +426,19 @@ Build a Python wheel:
 .venv/bin/maturin build --release
 ```
 
+Check a release artifact:
+
+```bash
+.venv/bin/pip install twine
+.venv/bin/twine check target/wheels/*
+```
+
+Publish manually:
+
+```bash
+.venv/bin/maturin publish
+```
+
 ---
 
 ## Repository Layout
@@ -283,6 +448,7 @@ crates/kron-core   Rust engine, log, scheduler, IPC, OpenRaft adapter
 crates/kron-cli    CLI for observe/admin/server mode
 crates/kron-py     Python bindings via PyO3
 docs/              design notes, ADRs, usage docs
+examples/          small runnable Python examples
 tests/python       Python integration tests
 ```
 
@@ -310,11 +476,17 @@ Kron does one thing:
 - [Storage Format](docs/reference/storage-format.md)
 - [Python Usage](docs/usage/python.md)
 - [CLI Usage](docs/usage/cli.md)
+- [Security Guide](docs/usage/security.md)
+- [Release Checklist](docs/usage/release.md)
+
+## Community Files
+
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
+- [Security Policy](SECURITY.md)
 
 ---
 
 ## License
 
 Kron is released under the [BSD 3-Clause License](LICENSE).
-
-This is the same permissive family of license used by the original Redis project.

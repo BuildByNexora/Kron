@@ -5,12 +5,12 @@ build-backend = "maturin"
 [project]
 name = "kron"
 version = "0.1.0"
-description = "Embedded application time engine"
+description = "Embedded-first runtime for reliable application scheduling"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Kron contributors" }]
-keywords = ["cron", "scheduler", "jobs", "embedded", "rust"]
+keywords = ["scheduler", "cron", "embedded", "timers", "rust", "python"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: BSD License",
@@ -25,13 +25,14 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Rust",
   "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
   "Topic :: System :: Systems Administration",
 ]
 
 [project.urls]
-Homepage = "https://github.com/kron/kron"
-Repository = "https://github.com/kron/kron"
-Issues = "https://github.com/kron/kron/issues"
+Homepage = "https://github.com/BuildByNexora/Kron"
+Repository = "https://github.com/BuildByNexora/Kron"
+Issues = "https://github.com/BuildByNexora/Kron/issues"
 
 [tool.maturin]
 manifest-path = "crates/kron-py/Cargo.toml"

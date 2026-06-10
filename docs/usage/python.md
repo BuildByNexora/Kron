@@ -1,5 +1,7 @@
 # Python Usage
 
+Embedded Python is the primary Kron API for `0.1.x`.
+
 ```python
 from datetime import datetime, timedelta, timezone
 import kron
@@ -20,9 +22,40 @@ kron.start(data_dir=".kron")
 
 Functions are not serialized. Re-register timers on application startup.
 
+Callbacks may accept no arguments:
+
+```python
+def cleanup():
+    ...
+```
+
+or one context dictionary:
+
+```python
+def cleanup(context):
+    print(context["timer_id"])
+    print(context["run_id"])
+```
+
+The v0.1 context is intentionally small. Future versions may add attempt metadata and idempotency keys.
+
+## Public API Contract
+
+- `kron.schedule(name, fn=callable, cron=... | every=... | after=... | at=..., timezone="UTC", max_attempts=3)` registers or re-registers a timer.
+- `kron.start(data_dir=".kron")` opens storage, starts the runtime in a background thread, and fails if another writer owns the data directory.
+- `kron.shutdown(timeout=5.0)` is safe to call even when the runtime is not started.
+- `kron.status(name)` returns a dictionary or `None`.
+- `kron.list()` returns a list of timer dictionaries.
+
+## Safety
+
+Callbacks can produce real side effects. Make them idempotent and safe to retry. Kron can make scheduling observable and durable, but it does not guarantee exactly-once side effects.
+
 ## Distributed Worker Alpha
 
-Distributed mode uses serializable task names and JSON payloads instead of embedded Python callbacks.
+Distributed mode is experimental. It uses serializable task names and JSON payloads instead of embedded Python callbacks.
+
+Do not use distributed mode for critical workloads until the 3-node failure test matrix and Raft storage backend are stronger.
 
 ```python
 import kron

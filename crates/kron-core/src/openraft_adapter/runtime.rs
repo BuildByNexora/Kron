@@ -64,7 +64,24 @@ impl OpenRaftCluster {
             ));
         }
         std::fs::create_dir_all(&data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let lock_path = data_dir.join("kron.lock");
+        #[cfg(unix)]
+        let lock_file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)?
+        };
+        #[cfg(not(unix))]
         let lock_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -180,7 +197,9 @@ impl OpenRaftCluster {
             worker_id: request.worker_id,
             tasks: request.tasks,
             lease_until: Utc::now()
-                + chrono::Duration::seconds(request.lease_seconds.unwrap_or(30) as i64),
+                + chrono::Duration::seconds(
+                    request.lease_seconds.unwrap_or_else(worker_lease_seconds) as i64,
+                ),
         })
         .await?;
         Ok(serde_json::json!({"registered": true}))
@@ -190,7 +209,7 @@ impl OpenRaftCluster {
         self.ensure_leader().await?;
         self.write_command(RaftCommand::HeartbeatWorker {
             worker_id: worker_id.to_string(),
-            lease_until: Utc::now() + chrono::Duration::seconds(30),
+            lease_until: Utc::now() + chrono::Duration::seconds(worker_lease_seconds() as i64),
         })
         .await?;
         Ok(serde_json::json!({"ok": true}))
@@ -224,6 +243,7 @@ impl OpenRaftCluster {
         self.write_command(RaftCommand::CompleteRun {
             run_id: RunId(run_id.to_string()),
             worker_id: request.worker_id,
+            fencing_token: request.fencing_token,
             completed_at: Utc::now(),
         })
         .await?;
@@ -240,6 +260,7 @@ impl OpenRaftCluster {
         self.write_command(RaftCommand::FailRun {
             run_id: RunId(run_id.to_string()),
             worker_id: request.worker_id,
+            fencing_token: request.fencing_token,
             error: request.error,
             failed_at: Utc::now(),
         })
@@ -448,7 +469,8 @@ impl OpenRaftCluster {
                 worker_id: worker_id.to_string(),
                 fencing_token: run.fencing_token,
                 attempt: run.attempt,
-                lease_deadline: Utc::now() + chrono::Duration::seconds(30),
+                lease_deadline: Utc::now()
+                    + chrono::Duration::seconds(worker_lease_seconds() as i64),
             })
             .await?;
             let app = self.store.app_state();
@@ -740,7 +762,8 @@ where
     let authorized = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
-        == Some(expected.as_str());
+        .map(|value| ipc::secure_eq(value.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false);
     if !authorized {
         return (
             StatusCode::UNAUTHORIZED,
@@ -803,6 +826,14 @@ fn parse_request_schedule(request: &CreateTimerRequest) -> Result<Schedule, Kron
     Ok(Schedule::At { at })
 }
 
+fn worker_lease_seconds() -> u64 {
+    std::env::var("KRON_WORKER_LEASE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(30)
+}
+
 pub fn server_token(data_dir: &Path) -> Result<String, KronError> {
     if let Ok(token) = std::env::var("KRON_CLUSTER_TOKEN") {
         return Ok(token);
@@ -810,11 +841,26 @@ pub fn server_token(data_dir: &Path) -> Result<String, KronError> {
     if ipc::token_path(data_dir).exists() {
         return ipc::read_token(data_dir);
     }
-    Ok(ulid::Ulid::new().to_string().to_lowercase())
+    ipc::generate_secret_token()
 }
 
 fn write_token_file(data_dir: &Path, token: &str) -> Result<(), KronError> {
     std::fs::create_dir_all(data_dir)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(ipc::token_path(data_dir))?;
+        file.write_all(format!("{token}\n").as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
     std::fs::write(ipc::token_path(data_dir), format!("{token}\n"))?;
     #[cfg(unix)]
     {

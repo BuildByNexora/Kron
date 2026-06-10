@@ -1,0 +1,16 @@
+/target/
+/.kron/
+/.kron-*/
+/.venv/
+/wheel-test/
+/.pytest_cache/
+__pycache__/
+*.pyc
+dist/
+*.egg-info/
+.maturin/
+.coverage
+htmlcov/
+.DS_Store
+*.tmp
+*.old

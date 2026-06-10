@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 
 use crate::engine::Engine;
 use crate::error::KronError;
@@ -14,6 +13,8 @@ use crate::event::Event;
 use crate::log::AppendOnlyLog;
 use crate::snapshot;
 use crate::timer::{TimerId, TimerSummary};
+
+const MAX_IPC_LINE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -56,16 +57,18 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
 pub fn start_server(engine: Arc<Engine>) -> Result<std::thread::JoinHandle<()>, KronError> {
     prepare_ipc_files(engine.data_dir())?;
     let token = read_or_create_token(engine.data_dir())?;
-    let tcp = start_tcp_server(Arc::clone(&engine), token.clone())?;
 
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
 
         let path = socket_path(engine.data_dir());
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let tcp = start_tcp_server(Arc::clone(&engine), token.clone())?;
 
         Ok(std::thread::spawn(move || {
             let _tcp = tcp;
@@ -115,8 +118,7 @@ pub fn request(data_dir: &Path, request: &IpcRequest) -> Result<IpcResponse, Kro
             stream.flush()?;
 
             let mut reader = BufReader::new(stream);
-            let mut response = String::new();
-            reader.read_line(&mut response)?;
+            let response = read_limited_line(&mut reader)?;
             let response = serde_json::from_str(&response)?;
             return Ok(response);
         }
@@ -129,8 +131,7 @@ pub fn request(data_dir: &Path, request: &IpcRequest) -> Result<IpcResponse, Kro
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
     let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    reader.read_line(&mut response)?;
+    let response = read_limited_line(&mut reader)?;
     Ok(serde_json::from_str(&response)?)
 }
 
@@ -144,13 +145,16 @@ fn handle_stream<S: std::io::Read + std::io::Write>(
     expected_token: &str,
 ) -> Result<(), KronError> {
     let mut reader = BufReader::new(&mut stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let line = read_limited_line(&mut reader)?;
     drop(reader);
 
     let request: IpcRequest = serde_json::from_str(&line)?;
     let request = match request {
-        IpcRequest::Auth { token, inner } if token == expected_token => *inner,
+        IpcRequest::Auth { token, inner }
+            if secure_eq(token.as_bytes(), expected_token.as_bytes()) =>
+        {
+            *inner
+        }
         IpcRequest::Auth { .. } => {
             let mut encoded = serde_json::to_string(&IpcResponse::Error {
                 message: "invalid IPC token".to_string(),
@@ -243,7 +247,7 @@ pub fn read_or_create_token(data_dir: &Path) -> Result<String, KronError> {
     if path.exists() {
         return read_token(data_dir);
     }
-    let token = Ulid::new().to_string().to_lowercase();
+    let token = generate_secret_token()?;
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -270,6 +274,13 @@ fn start_tcp_server(
     token: String,
 ) -> Result<std::thread::JoinHandle<()>, KronError> {
     let host = std::env::var("KRON_IPC_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    if !is_loopback_host(&host)
+        && std::env::var("KRON_UNSAFE_ALLOW_REMOTE_IPC").as_deref() != Ok("1")
+    {
+        return Err(KronError::IpcUnavailable(format!(
+            "refusing to bind IPC to non-loopback host {host}; set KRON_UNSAFE_ALLOW_REMOTE_IPC=1 only if you understand the risk"
+        )));
+    }
     let port = std::env::var("KRON_IPC_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
@@ -277,8 +288,14 @@ fn start_tcp_server(
     let listener = TcpListener::bind((host.as_str(), port))?;
     let addr = listener.local_addr()?;
     listener.set_nonblocking(true)?;
-    std::fs::write(port_path(engine.data_dir()), format!("{}\n", addr))?;
-    let stop_file = port_path(engine.data_dir());
+    let port_path = port_path(engine.data_dir());
+    std::fs::write(&port_path, format!("{}\n", addr))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&port_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let stop_file = port_path;
     Ok(std::thread::spawn(move || loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -297,6 +314,40 @@ fn start_tcp_server(
             Err(_) => break,
         }
     }))
+}
+
+fn read_limited_line<R: BufRead>(reader: &mut R) -> Result<String, KronError> {
+    let mut limited = reader.take(MAX_IPC_LINE_BYTES + 1);
+    let mut line = String::new();
+    let bytes = limited.read_line(&mut line)?;
+    if bytes as u64 > MAX_IPC_LINE_BYTES || !line.ends_with('\n') {
+        return Err(KronError::IpcUnavailable(
+            "IPC request exceeded maximum line size".to_string(),
+        ));
+    }
+    Ok(line)
+}
+
+pub fn generate_secret_token() -> Result<String, KronError> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|err| KronError::IpcUnavailable(format!("failed to generate token: {err}")))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub fn secure_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 fn read_tcp_endpoint(data_dir: &Path) -> Result<String, KronError> {

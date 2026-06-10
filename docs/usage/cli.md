@@ -1,5 +1,7 @@
 # CLI Usage
 
+The CLI is observe/admin first. It does not create embedded callback timers because Python functions are not serializable.
+
 ```bash
 kron --data-dir .kron job list
 kron --data-dir .kron job status email_digest
@@ -13,6 +15,15 @@ kron --data-dir .kron runtime shutdown
 The CLI uses the active runtime socket when available. If the runtime is not active, read-only commands replay `kron.snapshot` or `kron.aof`.
 
 ## Server Distributed Mode
+
+Server mode is experimental in `0.1.x`. It is useful for local testing of serializable worker tasks, but it is not the recommended path for critical workloads yet.
+
+Known alpha limitations:
+
+- the Raft store is segmented and checksummed, but still alpha storage;
+- leader redirect is still basic;
+- the required 3-node failure matrix is not complete;
+- storage compatibility is not guaranteed before v1.0.
 
 ```bash
 kron --data-dir .kron-server server start \

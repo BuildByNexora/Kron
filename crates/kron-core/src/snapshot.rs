@@ -191,6 +191,17 @@ pub fn write_snapshot_atomic(
     let snapshot = Snapshot::from_state(state, last_aof_offset);
 
     {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?
+        };
+        #[cfg(not(unix))]
         let mut file = File::create(&tmp_path)?;
         serde_json::to_writer_pretty(&mut file, &snapshot)?;
         file.write_all(b"\n")?;
@@ -210,6 +221,17 @@ pub fn compact(data_dir: &Path, state: &EngineState) -> Result<(), KronError> {
         let _ = std::fs::remove_file(&old);
         std::fs::rename(&aof, old)?;
     }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&aof)?
+    };
+    #[cfg(not(unix))]
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -234,6 +256,18 @@ fn sync_dir(path: &Path) -> Result<(), KronError> {
 
 pub fn try_compaction_lock(data_dir: &Path) -> Result<File, KronError> {
     let lock_path = data_dir.join("kron.lock");
+    #[cfg(unix)]
+    let lock = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)?
+    };
+    #[cfg(not(unix))]
     let lock = OpenOptions::new()
         .create(true)
         .read(true)

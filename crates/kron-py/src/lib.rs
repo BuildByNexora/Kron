@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -20,9 +20,10 @@ use kron_core::timer::{RunId, TimerId, TimerState, TimerSummary};
 use kron_core::Engine;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::{PyDict, PyList, PyModule};
 
 static GLOBAL: OnceLock<Mutex<GlobalState>> = OnceLock::new();
+const DEFAULT_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 fn global() -> &'static Mutex<GlobalState> {
     GLOBAL.get_or_init(|| Mutex::new(GlobalState::default()))
@@ -65,23 +66,55 @@ impl PyTimerFn {
 }
 
 impl TimerFn for PyTimerFn {
-    fn call(&self, _timer_id: &TimerId, _run_id: &RunId) -> Result<(), String> {
+    fn call(&self, timer_id: &TimerId, run_id: &RunId) -> Result<(), String> {
         Python::with_gil(|py| {
             let callable = self
                 .callable
                 .lock()
                 .map_err(|_| "python callable lock poisoned".to_string())?;
-            callable
-                .bind(py)
-                .call0()
-                .map(|_| ())
-                .map_err(|err| err.to_string())
+            let callable = callable.bind(py);
+            if callable_accepts_context(py, callable).unwrap_or(false) {
+                let context = PyDict::new_bound(py);
+                context
+                    .set_item("timer_id", timer_id.as_str())
+                    .map_err(|err| err.to_string())?;
+                context
+                    .set_item("run_id", run_id.0.as_str())
+                    .map_err(|err| err.to_string())?;
+                callable
+                    .call1((context,))
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+            } else {
+                callable.call0().map(|_| ()).map_err(|err| err.to_string())
+            }
         })
     }
 
     fn name(&self) -> String {
         self.function_name.clone()
     }
+}
+
+fn callable_accepts_context(py: Python<'_>, callable: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let inspect = py.import_bound("inspect")?;
+    let signature = inspect.call_method1("signature", (callable,))?;
+    let params = signature.getattr("parameters")?;
+    let builtins = py.import_bound("builtins")?;
+    let values = builtins
+        .call_method1("list", (params.call_method0("values")?,))?
+        .downcast_into::<PyList>()?;
+    for param in values.iter() {
+        let kind = param.getattr("kind")?;
+        let kind_name: String = kind.getattr("name")?.extract()?;
+        if matches!(
+            kind_name.as_str(),
+            "POSITIONAL_ONLY" | "POSITIONAL_OR_KEYWORD" | "VAR_POSITIONAL"
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[pyfunction(signature = (name, **kwargs))]
@@ -158,7 +191,7 @@ fn start(py: Python<'_>, data_dir: Option<String>) -> PyResult<()> {
     }
 
     let engine_for_thread = Arc::clone(&engine);
-    let ipc_join = ipc::start_server(Arc::clone(&engine)).ok();
+    let ipc_join = ipc::start_server(Arc::clone(&engine)).map_err(map_kron_error)?;
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let (stop_tx, stop_rx) = mpsc::channel();
     let join = thread::spawn(move || {
@@ -182,7 +215,7 @@ fn start(py: Python<'_>, data_dir: Option<String>) -> PyResult<()> {
                 engine,
                 stop_tx,
                 join: Some(join),
-                ipc_join,
+                ipc_join: Some(ipc_join),
             });
             Ok(())
         }
@@ -417,7 +450,7 @@ impl Worker {
 
     #[pyo3(signature = (timeout=20.0))]
     fn run_once(&self, py: Python<'_>, timeout: f64) -> PyResult<bool> {
-        let _ = timeout;
+        let timeout = seconds_to_duration(timeout)?;
         self.register()?;
         let tasks = self.task_names()?;
         let body = serde_json::json!({
@@ -425,7 +458,14 @@ impl Worker {
             "tasks": tasks,
         });
         let response = py.allow_threads(|| {
-            http_request(&self.server, &self.token, "POST", "/v1/workers/poll", body)
+            http_request_with_timeout(
+                &self.server,
+                &self.token,
+                "POST",
+                "/v1/workers/poll",
+                body,
+                timeout,
+            )
         })?;
         if response.is_null() {
             return Ok(false);
@@ -564,14 +604,36 @@ fn http_request(
     path: &str,
     body: serde_json::Value,
 ) -> PyResult<serde_json::Value> {
+    http_request_with_timeout(server, token, method, path, body, DEFAULT_HTTP_TIMEOUT)
+}
+
+fn http_request_with_timeout(
+    server: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+    timeout: StdDuration,
+) -> PyResult<serde_json::Value> {
     let server = normalize_server(server);
     let body = if body.is_null() {
         String::new()
     } else {
         serde_json::to_string(&body).map_err(|err| PyRuntimeError::new_err(err.to_string()))?
     };
-    let mut stream =
-        TcpStream::connect(&server).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    let addr = server
+        .to_socket_addrs()
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?
+        .next()
+        .ok_or_else(|| PyRuntimeError::new_err(format!("could not resolve server {server}")))?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
     write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: {server}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -583,10 +645,28 @@ fn http_request(
     stream
         .read_to_string(&mut response)
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    let (_, body) = response
+    let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| PyRuntimeError::new_err("invalid HTTP response"))?;
-    serde_json::from_str(body).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| PyRuntimeError::new_err("invalid HTTP status line"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    if !(200..300).contains(&status) {
+        let message = parsed
+            .get("error")
+            .or_else(|| parsed.get("message"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("HTTP request failed");
+        return Err(PyRuntimeError::new_err(format!(
+            "HTTP {status} from {server}: {message}"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn py_to_json(py: Python<'_>, value: PyObject) -> PyResult<serde_json::Value> {

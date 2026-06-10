@@ -16,6 +16,7 @@ fs2        = { workspace = true }
 openraft   = { workspace = true }
 axum       = { workspace = true }
 reqwest    = { workspace = true }
+getrandom  = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
