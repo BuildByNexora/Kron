@@ -14,6 +14,7 @@ use chrono::Utc;
 use fs2::FileExt;
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use openraft::{BasicNode, Config, Raft};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::cluster::{
@@ -31,6 +32,55 @@ use crate::schedule::Schedule;
 use crate::timer::{RunId, TimerId};
 
 pub type KronRaft = Raft<KronTypeConfig>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthRole {
+    Reader,
+    Worker,
+    Operator,
+    Admin,
+    Raft,
+}
+
+impl AuthRole {
+    fn allows(self, required: AuthRole) -> bool {
+        matches!(self, AuthRole::Admin)
+            || self == required
+            || matches!((self, required), (AuthRole::Operator, AuthRole::Reader))
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthRole::Reader => "reader",
+            AuthRole::Worker => "worker",
+            AuthRole::Operator => "operator",
+            AuthRole::Admin => "admin",
+            AuthRole::Raft => "raft",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthContext {
+    actor: String,
+    role: AuthRole,
+    tenant_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenFile {
+    tokens: Vec<TokenEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenEntry {
+    name: String,
+    token: String,
+    role: AuthRole,
+    #[serde(default)]
+    tenant_id: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct OpenRaftCluster {
@@ -143,13 +193,27 @@ impl OpenRaftCluster {
 
     pub async fn create_timer(
         &self,
-        request: CreateTimerRequest,
+        mut request: CreateTimerRequest,
+        tenant_id: Option<String>,
     ) -> Result<DistributedSummary, KronError> {
         self.ensure_leader().await?;
+        if let Some(scoped_tenant) = tenant_id {
+            if request
+                .tenant_id
+                .as_deref()
+                .is_some_and(|requested| requested != scoped_tenant)
+            {
+                return Err(KronError::IpcUnavailable(
+                    "token tenant does not match requested tenant".to_string(),
+                ));
+            }
+            request.tenant_id = Some(scoped_tenant);
+        }
         let schedule = parse_request_schedule(&request)?;
         let id = TimerId::new(request.name);
         let spec = DistributedTimerSpec {
             id: id.clone(),
+            tenant_id: request.tenant_id,
             schedule,
             retry: RetryPolicy {
                 max_attempts: request.max_attempts.unwrap_or(3),
@@ -175,8 +239,24 @@ impl OpenRaftCluster {
         self.store.app_state().timers.into_values().collect()
     }
 
+    pub fn list_for_tenant(&self, tenant_id: Option<&str>) -> Vec<DistributedSummary> {
+        self.list()
+            .into_iter()
+            .filter(|summary| tenant_matches(tenant_id, summary.tenant_id.as_deref()))
+            .collect()
+    }
+
     pub fn status(&self, name: &str) -> Option<DistributedSummary> {
         self.store.app_state().timers.remove(name)
+    }
+
+    pub fn status_for_tenant(
+        &self,
+        name: &str,
+        tenant_id: Option<&str>,
+    ) -> Option<DistributedSummary> {
+        self.status(name)
+            .filter(|summary| tenant_matches(tenant_id, summary.tenant_id.as_deref()))
     }
 
     pub fn history(&self, name: &str) -> Vec<serde_json::Value> {
@@ -185,6 +265,20 @@ impl OpenRaftCluster {
             .history
             .into_iter()
             .filter(|entry| entry.get("timer").and_then(|v| v.as_str()) == Some(name))
+            .collect()
+    }
+
+    pub fn history_for_tenant(
+        &self,
+        name: &str,
+        tenant_id: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        self.history(name)
+            .into_iter()
+            .filter(|entry| {
+                let entry_tenant = entry.get("tenant_id").and_then(|v| v.as_str());
+                tenant_matches(tenant_id, entry_tenant)
+            })
             .collect()
     }
 
@@ -218,12 +312,16 @@ impl OpenRaftCluster {
     pub async fn poll_worker(
         &self,
         request: WorkerPollRequest,
+        tenant_id: Option<String>,
     ) -> Result<Option<WorkerRun>, KronError> {
         self.ensure_leader().await?;
         self.heartbeat_worker(&request.worker_id).await?;
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(run) = self.try_claim(&request.worker_id, &request.tasks).await? {
+            if let Some(run) = self
+                .try_claim(&request.worker_id, &request.tasks, tenant_id.as_deref())
+                .await?
+            {
                 return Ok(Some(run));
             }
             if std::time::Instant::now() >= deadline || self.is_shutting_down() {
@@ -237,9 +335,15 @@ impl OpenRaftCluster {
         &self,
         run_id: &str,
         request: RunCompleteRequest,
+        tenant_id: Option<String>,
     ) -> Result<serde_json::Value, KronError> {
         self.ensure_leader().await?;
-        self.validate_active_run(run_id, &request.worker_id, request.fencing_token)?;
+        self.validate_active_run(
+            run_id,
+            &request.worker_id,
+            request.fencing_token,
+            tenant_id.as_deref(),
+        )?;
         self.write_command(RaftCommand::CompleteRun {
             run_id: RunId(run_id.to_string()),
             worker_id: request.worker_id,
@@ -254,9 +358,15 @@ impl OpenRaftCluster {
         &self,
         run_id: &str,
         request: RunFailRequest,
+        tenant_id: Option<String>,
     ) -> Result<serde_json::Value, KronError> {
         self.ensure_leader().await?;
-        self.validate_active_run(run_id, &request.worker_id, request.fencing_token)?;
+        self.validate_active_run(
+            run_id,
+            &request.worker_id,
+            request.fencing_token,
+            tenant_id.as_deref(),
+        )?;
         self.write_command(RaftCommand::FailRun {
             run_id: RunId(run_id.to_string()),
             worker_id: request.worker_id,
@@ -384,6 +494,7 @@ impl OpenRaftCluster {
                     .unwrap_or(active.fencing_token + 1);
                 Some(WorkerRun {
                     timer: active.timer_id.as_str().to_string(),
+                    tenant_id: spec.tenant_id.clone(),
                     run_id: active.run_id.0.clone(),
                     task,
                     payload,
@@ -427,6 +538,7 @@ impl OpenRaftCluster {
         &self,
         worker_id: &str,
         tasks: &[String],
+        tenant_id: Option<&str>,
     ) -> Result<Option<WorkerRun>, KronError> {
         let claim = {
             let _guard = self.claim_lock.lock().unwrap();
@@ -438,6 +550,9 @@ impl OpenRaftCluster {
                 .map(|run| run.timer_id.as_str().to_string())
                 .collect();
             app.timers.values().find_map(|summary| {
+                if !tenant_matches(tenant_id, summary.tenant_id.as_deref()) {
+                    return None;
+                }
                 if active_timer_ids.contains(&summary.id) {
                     return None;
                 }
@@ -453,6 +568,7 @@ impl OpenRaftCluster {
                 }
                 Some(WorkerRun {
                     timer: summary.id.clone(),
+                    tenant_id: summary.tenant_id.clone(),
                     run_id: RunId::new().0,
                     task,
                     payload,
@@ -491,6 +607,7 @@ impl OpenRaftCluster {
         run_id: &str,
         worker_id: &str,
         fencing_token: u64,
+        tenant_id: Option<&str>,
     ) -> Result<(), KronError> {
         let app = self.store.app_state();
         let active = app
@@ -504,6 +621,15 @@ impl OpenRaftCluster {
         }
         if active.fencing_token != fencing_token {
             return Err(KronError::IpcUnavailable("stale fencing token".to_string()));
+        }
+        let run_tenant = app
+            .specs
+            .get(active.timer_id.as_str())
+            .and_then(|spec| spec.tenant_id.as_deref());
+        if !tenant_matches(tenant_id, run_tenant) {
+            return Err(KronError::IpcUnavailable(
+                "token tenant does not match run tenant".to_string(),
+            ));
         }
         Ok(())
     }
@@ -567,9 +693,13 @@ async fn create_timer(
     headers: HeaderMap,
     Json(request): Json<CreateTimerRequest>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster.create_timer(request).await
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Operator,
+        "timer.create",
+        move |auth| async move { cluster.create_timer(request, auth.tenant_id.clone()).await },
+    )
     .await
 }
 
@@ -577,7 +707,9 @@ async fn list_timers(State(cluster): State<Arc<OpenRaftCluster>>, headers: Heade
     authed(
         Arc::clone(&cluster),
         &headers,
-        async move { Ok(cluster.list()) },
+        AuthRole::Reader,
+        "timer.list",
+        move |auth| async move { Ok(cluster.list_for_tenant(auth.tenant_id.as_deref())) },
     )
     .await
 }
@@ -587,9 +719,13 @@ async fn status_timer(
     headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        Ok(cluster.status(&name))
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Reader,
+        "timer.status",
+        move |auth| async move { Ok(cluster.status_for_tenant(&name, auth.tenant_id.as_deref())) },
+    )
     .await
 }
 
@@ -598,9 +734,13 @@ async fn history_timer(
     headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        Ok(cluster.history(&name))
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Reader,
+        "timer.history",
+        move |auth| async move { Ok(cluster.history_for_tenant(&name, auth.tenant_id.as_deref())) },
+    )
     .await
 }
 
@@ -609,9 +749,13 @@ async fn register_worker(
     headers: HeaderMap,
     Json(request): Json<WorkerRegisterRequest>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster.register_worker(request).await
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Worker,
+        "worker.register",
+        move |_auth| async move { cluster.register_worker(request).await },
+    )
     .await
 }
 
@@ -620,13 +764,19 @@ async fn heartbeat_worker(
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        let worker_id = value
-            .get("worker_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        cluster.heartbeat_worker(worker_id).await
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Worker,
+        "worker.heartbeat",
+        move |_auth| async move {
+            let worker_id = value
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            cluster.heartbeat_worker(worker_id).await
+        },
+    )
     .await
 }
 
@@ -635,9 +785,13 @@ async fn poll_worker(
     headers: HeaderMap,
     Json(request): Json<WorkerPollRequest>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster.poll_worker(request).await
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Worker,
+        "worker.poll",
+        move |auth| async move { cluster.poll_worker(request, auth.tenant_id.clone()).await },
+    )
     .await
 }
 
@@ -647,9 +801,17 @@ async fn succeed_run(
     AxumPath(run_id): AxumPath<String>,
     Json(request): Json<RunCompleteRequest>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster.complete_run(&run_id, request).await
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Worker,
+        "run.succeed",
+        move |auth| async move {
+            cluster
+                .complete_run(&run_id, request, auth.tenant_id.clone())
+                .await
+        },
+    )
     .await
 }
 
@@ -659,9 +821,17 @@ async fn fail_run(
     AxumPath(run_id): AxumPath<String>,
     Json(request): Json<RunFailRequest>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster.fail_run(&run_id, request).await
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Worker,
+        "run.fail",
+        move |auth| async move {
+            cluster
+                .fail_run(&run_id, request, auth.tenant_id.clone())
+                .await
+        },
+    )
     .await
 }
 
@@ -669,9 +839,13 @@ async fn cluster_status(
     State(cluster): State<Arc<OpenRaftCluster>>,
     headers: HeaderMap,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        Ok(cluster.cluster_status())
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Reader,
+        "cluster.status",
+        move |_auth| async move { Ok(cluster.cluster_status()) },
+    )
     .await
 }
 
@@ -680,9 +854,13 @@ async fn join_cluster(
     headers: HeaderMap,
     Json(request): Json<JoinRequest>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster.join(request).await
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Admin,
+        "cluster.join",
+        move |_auth| async move { cluster.join(request).await },
+    )
     .await
 }
 
@@ -691,9 +869,13 @@ async fn leave_cluster(
     headers: HeaderMap,
     Json(request): Json<LeaveRequest>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster.leave(request).await
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Admin,
+        "cluster.leave",
+        move |_auth| async move { cluster.leave(request).await },
+    )
     .await
 }
 
@@ -701,10 +883,16 @@ async fn shutdown_runtime(
     State(cluster): State<Arc<OpenRaftCluster>>,
     headers: HeaderMap,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster.shutdown();
-        Ok(serde_json::json!({"shutdown": "requested"}))
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Admin,
+        "runtime.shutdown",
+        move |_auth| async move {
+            cluster.shutdown();
+            Ok(serde_json::json!({"shutdown": "requested"}))
+        },
+    )
     .await
 }
 
@@ -713,13 +901,19 @@ async fn raft_append_entries(
     headers: HeaderMap,
     Json(request): Json<AppendEntriesRequest<KronTypeConfig>>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster
-            .raft
-            .append_entries(request)
-            .await
-            .map_err(|err| KronError::IpcUnavailable(err.to_string()))
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Raft,
+        "raft.append_entries",
+        move |_auth| async move {
+            cluster
+                .raft
+                .append_entries(request)
+                .await
+                .map_err(|err| KronError::IpcUnavailable(err.to_string()))
+        },
+    )
     .await
 }
 
@@ -728,13 +922,19 @@ async fn raft_vote(
     headers: HeaderMap,
     Json(request): Json<VoteRequest<u64>>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster
-            .raft
-            .vote(request)
-            .await
-            .map_err(|err| KronError::IpcUnavailable(err.to_string()))
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Raft,
+        "raft.vote",
+        move |_auth| async move {
+            cluster
+                .raft
+                .vote(request)
+                .await
+                .map_err(|err| KronError::IpcUnavailable(err.to_string()))
+        },
+    )
     .await
 }
 
@@ -743,36 +943,79 @@ async fn raft_install_snapshot(
     headers: HeaderMap,
     Json(request): Json<InstallSnapshotRequest<KronTypeConfig>>,
 ) -> Response {
-    authed(Arc::clone(&cluster), &headers, async move {
-        cluster
-            .raft
-            .install_snapshot(request)
-            .await
-            .map_err(|err| KronError::IpcUnavailable(err.to_string()))
-    })
+    authed(
+        Arc::clone(&cluster),
+        &headers,
+        AuthRole::Raft,
+        "raft.install_snapshot",
+        move |_auth| async move {
+            cluster
+                .raft
+                .install_snapshot(request)
+                .await
+                .map_err(|err| KronError::IpcUnavailable(err.to_string()))
+        },
+    )
     .await
 }
 
-async fn authed<T, F>(cluster: Arc<OpenRaftCluster>, headers: &HeaderMap, f: F) -> Response
+async fn authed<T, F, Fut>(
+    cluster: Arc<OpenRaftCluster>,
+    headers: &HeaderMap,
+    required_role: AuthRole,
+    action: &'static str,
+    f: F,
+) -> Response
 where
     T: serde::Serialize,
-    F: std::future::Future<Output = Result<T, KronError>>,
+    F: FnOnce(AuthContext) -> Fut,
+    Fut: std::future::Future<Output = Result<T, KronError>>,
 {
-    let expected = format!("Bearer {}", cluster.token);
-    let authorized = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| ipc::secure_eq(value.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false);
-    if !authorized {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
-        )
-            .into_response();
-    }
-    match f.await {
-        Ok(value) => (StatusCode::OK, Json(serde_json::to_value(value).unwrap())).into_response(),
+    let auth = match authenticate(&cluster, headers) {
+        Ok(auth) if auth.role.allows(required_role) => auth,
+        Ok(auth) => {
+            audit(
+                &cluster,
+                Some(&auth),
+                action,
+                "forbidden",
+                StatusCode::FORBIDDEN.as_u16(),
+                Some(required_role.as_str()),
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "forbidden", "required_role": required_role.as_str()})),
+            )
+                .into_response();
+        }
+        Err(reason) => {
+            audit(
+                &cluster,
+                None,
+                action,
+                "unauthorized",
+                StatusCode::UNAUTHORIZED.as_u16(),
+                Some(&reason),
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized"})),
+            )
+                .into_response();
+        }
+    };
+    match f(auth.clone()).await {
+        Ok(value) => {
+            audit(
+                &cluster,
+                Some(&auth),
+                action,
+                "ok",
+                StatusCode::OK.as_u16(),
+                None,
+            );
+            (StatusCode::OK, Json(serde_json::to_value(value).unwrap())).into_response()
+        }
         Err(err) => {
             let text = err.to_string();
             let value = if let Some(json_start) = text.find('{') {
@@ -786,8 +1029,96 @@ where
             } else {
                 StatusCode::BAD_REQUEST
             };
+            audit(
+                &cluster,
+                Some(&auth),
+                action,
+                "error",
+                status.as_u16(),
+                value.get("error").and_then(|v| v.as_str()),
+            );
             (status, Json(value)).into_response()
         }
+    }
+}
+
+fn authenticate(cluster: &OpenRaftCluster, headers: &HeaderMap) -> Result<AuthContext, String> {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| "missing bearer token".to_string())?;
+
+    let tokens_path = cluster.data_dir.join("kron.tokens.json");
+    if tokens_path.exists() {
+        let content = std::fs::read_to_string(&tokens_path)
+            .map_err(|err| format!("unable to read token file: {err}"))?;
+        let token_file: TokenFile =
+            serde_json::from_str(&content).map_err(|err| format!("invalid token file: {err}"))?;
+        return token_file
+            .tokens
+            .into_iter()
+            .find(|entry| ipc::secure_eq(entry.token.as_bytes(), bearer.as_bytes()))
+            .map(|entry| AuthContext {
+                actor: entry.name,
+                role: entry.role,
+                tenant_id: entry.tenant_id,
+            })
+            .ok_or_else(|| "unknown token".to_string());
+    }
+
+    if ipc::secure_eq(cluster.token.as_bytes(), bearer.as_bytes()) {
+        return Ok(AuthContext {
+            actor: "legacy-admin-token".to_string(),
+            role: AuthRole::Admin,
+            tenant_id: None,
+        });
+    }
+    Err("unknown token".to_string())
+}
+
+fn audit(
+    cluster: &OpenRaftCluster,
+    auth: Option<&AuthContext>,
+    action: &str,
+    outcome: &str,
+    status: u16,
+    reason: Option<&str>,
+) {
+    let event = serde_json::json!({
+        "ts": Utc::now(),
+        "node_id": cluster.node_name,
+        "action": action,
+        "outcome": outcome,
+        "status": status,
+        "actor": auth.map(|ctx| ctx.actor.as_str()).unwrap_or("anonymous"),
+        "role": auth.map(|ctx| ctx.role.as_str()).unwrap_or("none"),
+        "tenant_id": auth.and_then(|ctx| ctx.tenant_id.as_deref()),
+        "reason": reason,
+    });
+    let path = cluster.data_dir.join("kron.audit.jsonl");
+    use std::io::Write;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+    };
+    #[cfg(not(unix))]
+    let file = OpenOptions::new().create(true).append(true).open(&path);
+    if let Ok(mut file) = file {
+        let _ = writeln!(file, "{event}");
+        let _ = file.sync_data();
+    }
+}
+
+fn tenant_matches(request_tenant: Option<&str>, resource_tenant: Option<&str>) -> bool {
+    match request_tenant {
+        None | Some("*") => true,
+        Some(tenant) => resource_tenant == Some(tenant),
     }
 }
 
@@ -889,4 +1220,33 @@ fn parse_addr(value: &str) -> Result<SocketAddr, KronError> {
     value
         .parse()
         .map_err(|err| KronError::IpcUnavailable(format!("invalid socket address {value}: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_roles_allow_only_expected_actions() {
+        assert!(AuthRole::Admin.allows(AuthRole::Raft));
+        assert!(AuthRole::Admin.allows(AuthRole::Operator));
+        assert!(AuthRole::Operator.allows(AuthRole::Reader));
+        assert!(AuthRole::Operator.allows(AuthRole::Operator));
+        assert!(!AuthRole::Operator.allows(AuthRole::Worker));
+        assert!(AuthRole::Worker.allows(AuthRole::Worker));
+        assert!(!AuthRole::Worker.allows(AuthRole::Reader));
+        assert!(AuthRole::Reader.allows(AuthRole::Reader));
+        assert!(!AuthRole::Reader.allows(AuthRole::Operator));
+        assert!(AuthRole::Raft.allows(AuthRole::Raft));
+        assert!(!AuthRole::Raft.allows(AuthRole::Reader));
+    }
+
+    #[test]
+    fn tenant_match_restricts_scoped_tokens() {
+        assert!(tenant_matches(None, Some("tenant-a")));
+        assert!(tenant_matches(Some("*"), Some("tenant-a")));
+        assert!(tenant_matches(Some("tenant-a"), Some("tenant-a")));
+        assert!(!tenant_matches(Some("tenant-a"), Some("tenant-b")));
+        assert!(!tenant_matches(Some("tenant-a"), None));
+    }
 }

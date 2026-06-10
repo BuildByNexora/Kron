@@ -63,6 +63,8 @@ pub enum TimerTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributedTimerSpec {
     pub id: TimerId,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub schedule: Schedule,
     pub retry: RetryPolicy,
     pub timezone: String,
@@ -73,6 +75,8 @@ pub struct DistributedTimerSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTimerRequest {
     pub name: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub cron: Option<String>,
     pub every: Option<String>,
     pub after: Option<String>,
@@ -86,6 +90,8 @@ pub struct CreateTimerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegisterRequest {
     pub worker_id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub tasks: Vec<String>,
     pub lease_seconds: Option<u64>,
 }
@@ -93,6 +99,8 @@ pub struct WorkerRegisterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerPollRequest {
     pub worker_id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub tasks: Vec<String>,
 }
 
@@ -112,6 +120,8 @@ pub struct RunFailRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRun {
     pub timer: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub run_id: String,
     pub task: String,
     pub payload: serde_json::Value,
@@ -123,6 +133,8 @@ pub struct WorkerRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributedSummary {
     pub id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub state: TimerState,
     pub target: TimerTarget,
     pub next_run_at: Option<DateTime<Utc>>,
@@ -355,6 +367,7 @@ impl ClusterEngine {
         let id = TimerId::new(request.name);
         let spec = DistributedTimerSpec {
             id: id.clone(),
+            tenant_id: request.tenant_id,
             schedule,
             retry: RetryPolicy {
                 max_attempts: request.max_attempts.unwrap_or(3),
@@ -613,6 +626,7 @@ impl ClusterEngine {
                     state.fencing.insert(id.clone(), token);
                     state.pending.push_back(WorkerRun {
                         timer: id.as_str().to_string(),
+                        tenant_id: spec.tenant_id.clone(),
                         run_id: run_id.0,
                         task,
                         payload,
@@ -708,6 +722,7 @@ impl ClusterEngine {
             );
             state.pending.push_back(WorkerRun {
                 timer: active.timer_id.as_str().to_string(),
+                tenant_id: spec.tenant_id.clone(),
                 run_id: active.run_id.0,
                 task,
                 payload,
@@ -1374,6 +1389,7 @@ fn summary_for(state: &ClusterState, id: &TimerId) -> Option<DistributedSummary>
     let spec = state.timers.get(id)?;
     Some(DistributedSummary {
         id: id.as_str().to_string(),
+        tenant_id: spec.tenant_id.clone(),
         state: state
             .states
             .get(id)
@@ -1432,6 +1448,7 @@ mod tests {
     fn timer_request(name: &str) -> CreateTimerRequest {
         CreateTimerRequest {
             name: name.to_string(),
+            tenant_id: None,
             cron: None,
             every: Some("1s".to_string()),
             after: None,
@@ -1447,6 +1464,7 @@ mod tests {
     fn raft_command_round_trips() {
         let spec = DistributedTimerSpec {
             id: TimerId::new("roundtrip"),
+            tenant_id: None,
             schedule: Schedule::Every { seconds: 60 },
             retry: RetryPolicy::no_retry(),
             timezone: "UTC".to_string(),
@@ -1480,6 +1498,7 @@ mod tests {
         engine
             .register_worker(WorkerRegisterRequest {
                 worker_id: "w1".to_string(),
+                tenant_id: None,
                 tasks: vec!["digest".to_string()],
                 lease_seconds: Some(30),
             })
@@ -1509,6 +1528,7 @@ mod tests {
         engine
             .register_worker(WorkerRegisterRequest {
                 worker_id: "w1".to_string(),
+                tenant_id: None,
                 tasks: vec!["digest".to_string()],
                 lease_seconds: Some(30),
             })
@@ -1546,6 +1566,7 @@ mod tests {
         engine
             .register_worker(WorkerRegisterRequest {
                 worker_id: "w1".to_string(),
+                tenant_id: None,
                 tasks: vec!["digest".to_string()],
                 lease_seconds: Some(30),
             })

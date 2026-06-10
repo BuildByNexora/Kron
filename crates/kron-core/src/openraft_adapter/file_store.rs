@@ -180,6 +180,7 @@ impl KronRaftFileStore {
                     id.clone(),
                     DistributedSummary {
                         id: id.clone(),
+                        tenant_id: timer.spec.tenant_id.clone(),
                         state: timer.state.clone(),
                         target: timer.spec.target.clone(),
                         next_run_at: inner.state_machine.next_runs.get(id).copied(),
@@ -456,6 +457,7 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
             state.history.push(serde_json::json!({
                 "type": "TIMER_CREATED",
                 "timer": id,
+                "tenant_id": state.timers.get(&id).and_then(|timer| timer.spec.tenant_id.clone()),
             }));
         }
         RaftCommand::CancelTimer { timer_id } => {
@@ -515,6 +517,7 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
             state.history.push(serde_json::json!({
                 "type": "RUN_CLAIMED",
                 "timer": timer_id.as_str(),
+                "tenant_id": timer_tenant(state, timer_id.as_str()),
                 "run_id": run_id.0,
                 "worker_id": worker_id,
                 "fencing_token": fencing_token,
@@ -543,6 +546,7 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
                 state.history.push(serde_json::json!({
                     "type": "RUN_SUCCEEDED",
                     "timer": active.timer_id.as_str(),
+                    "tenant_id": timer_tenant(state, active.timer_id.as_str()),
                     "run_id": run_id.0,
                     "worker_id": worker_id,
                     "fencing_token": active.fencing_token,
@@ -572,6 +576,7 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
                 state.history.push(serde_json::json!({
                     "type": "RUN_FAILED",
                     "timer": active.timer_id.as_str(),
+                    "tenant_id": timer_tenant(state, active.timer_id.as_str()),
                     "run_id": run_id.0,
                     "worker_id": worker_id,
                     "error": error,
@@ -588,6 +593,7 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
                 state.history.push(serde_json::json!({
                     "type": "RUN_LEASE_EXPIRED",
                     "timer": active.timer_id.as_str(),
+                    "tenant_id": timer_tenant(state, active.timer_id.as_str()),
                     "run_id": active.run_id.0,
                     "worker_id": active.worker_id,
                     "fencing_token": active.fencing_token,
@@ -629,6 +635,13 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
         }
         RaftCommand::AddNode { .. } | RaftCommand::RemoveNode { .. } => {}
     }
+}
+
+fn timer_tenant(state: &PersistedStateMachine, timer_id: &str) -> Option<String> {
+    state
+        .timers
+        .get(timer_id)
+        .and_then(|timer| timer.spec.tenant_id.clone())
 }
 
 fn set_state(state: &mut PersistedStateMachine, timer_id: &TimerId, timer_state: TimerState) {
@@ -1047,6 +1060,7 @@ mod tests {
     fn timer_spec(name: &str) -> DistributedTimerSpec {
         DistributedTimerSpec {
             id: TimerId::new(name),
+            tenant_id: None,
             schedule: Schedule::Every { seconds: 60 },
             retry: RetryPolicy::default(),
             timezone: "UTC".to_string(),

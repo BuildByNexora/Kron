@@ -5,6 +5,7 @@ use std::path::Path;
 use clap::Subcommand;
 use kron_core::ipc;
 use kron_core::openraft_adapter::runtime::{self, OpenRaftCluster};
+use serde::Deserialize;
 
 #[derive(Subcommand)]
 pub enum ServerCommand {
@@ -150,8 +151,7 @@ pub fn request(
 ) -> Result<serde_json::Value, String> {
     let endpoint = std::fs::read_to_string(data_dir.join("kron.http"))
         .map_err(|_| "server endpoint not found; is `kron server start` running?".to_string())?;
-    let token = std::fs::read_to_string(ipc::token_path(data_dir))
-        .map_err(|_| "server token not found".to_string())?;
+    let token = server_request_token(data_dir)?;
     let body = if body.is_null() {
         String::new()
     } else {
@@ -175,4 +175,45 @@ pub fn request(
         .split_once("\r\n\r\n")
         .ok_or_else(|| "invalid HTTP response".to_string())?;
     serde_json::from_str(body).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+struct CliTokenFile {
+    tokens: Vec<CliTokenEntry>,
+}
+
+#[derive(Deserialize)]
+struct CliTokenEntry {
+    token: String,
+    role: String,
+}
+
+fn server_request_token(data_dir: &Path) -> Result<String, String> {
+    if let Ok(token) = std::env::var("KRON_TOKEN") {
+        if !token.trim().is_empty() {
+            return Ok(token);
+        }
+    }
+    let legacy = ipc::token_path(data_dir);
+    if legacy.exists() {
+        return std::fs::read_to_string(legacy)
+            .map(|token| token.trim().to_string())
+            .map_err(|_| "server token not found".to_string());
+    }
+    let tokens_path = data_dir.join("kron.tokens.json");
+    let content = std::fs::read_to_string(&tokens_path).map_err(|_| {
+        "server token not found; set KRON_TOKEN or create kron.token/kron.tokens.json".to_string()
+    })?;
+    let token_file: CliTokenFile =
+        serde_json::from_str(&content).map_err(|err| format!("invalid kron.tokens.json: {err}"))?;
+    ["admin", "operator", "reader", "worker", "raft"]
+        .into_iter()
+        .find_map(|role| {
+            token_file
+                .tokens
+                .iter()
+                .find(|entry| entry.role == role)
+                .map(|entry| entry.token.clone())
+        })
+        .ok_or_else(|| "kron.tokens.json does not contain a usable token".to_string())
 }
