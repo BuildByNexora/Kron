@@ -32,6 +32,10 @@ enum Command {
         #[command(subcommand)]
         command: commands::server::ServerCommand,
     },
+    Audit {
+        #[command(subcommand)]
+        command: commands::audit::AuditCommand,
+    },
     Doctor,
 }
 
@@ -47,6 +51,7 @@ fn main() {
         Command::Log { command } => commands::log::run(command, &data_dir),
         Command::Runtime { command } => commands::runtime::run(command, &data_dir),
         Command::Server { command } => commands::server::run(command, &data_dir),
+        Command::Audit { command } => commands::audit::run(command, &data_dir),
         Command::Doctor => commands::doctor::run(&data_dir),
     };
 

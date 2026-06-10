@@ -62,13 +62,52 @@ infrastructure stack.
 | Role-based server auth | Server mode supports `reader`, `worker`, `operator`, `admin`, and `raft` roles |
 | Online token reload | `kron.tokens.json` can be updated without restarting the server |
 | Tenant-scoped workers | Server timers and worker polling can be scoped by `tenant_id` |
-| Audit log | Server security decisions are written to append-only JSONL audit events |
+| Audit log | Server security decisions are written to append-only hash-chained JSONL audit events |
 | Distributed mode | OpenRaft-backed server mode supports leader election and replication |
 | Worker leases | Abandoned distributed runs can be reclaimed after lease expiry |
 | Fencing tokens | Stale distributed workers are rejected during completion |
 | Storage corruption checks | Middle corruption fails loudly; final truncated tails are handled deterministically |
 | Tested failure paths | Crash recovery, compaction, lock conflicts, failover, stale completion, and stress tests are covered |
 | PyPI package | Install with `pip install kron-scheduler` and import with `import kron` |
+
+---
+
+## Embedded And Edge
+
+Kron is designed for systems where every extra service matters.
+
+No Redis.
+No broker.
+No cloud scheduler.
+No external database.
+No always-on scheduler server for embedded mode.
+
+Kron stores timer state locally, runs inside the application process, and uses a
+Rust core for scheduling, persistence, locking, retry, and recovery.
+
+This makes Kron a natural fit for:
+
+- edge devices;
+- local agents;
+- RISC-V boards;
+- industrial systems;
+- private appliances;
+- offline-first services;
+- small servers with limited memory and CPU;
+- applications that need reliable scheduled work without a full infrastructure
+  stack.
+
+Embedded mode keeps the deployment shape simple:
+
+```text
+application process
+      |
+      v
+Kron embedded runtime
+      |
+      v
+local durable state in .kron/
+```
 
 ---
 
@@ -282,7 +321,8 @@ Kron provides:
 - role-scoped bearer tokens;
 - online token reload through `kron.tokens.json`;
 - tenant-scoped server timers and worker polling;
-- append-only security audit log.
+- embedded append-only event history;
+- server security audit log with hash-chain verification.
 
 ---
 
@@ -586,6 +626,43 @@ Example CLI history:
 
 ---
 
+## Embedded Logs And Audit Logs
+
+Kron has two log layers:
+
+| Log | Mode | Purpose | File |
+|---|---|---|---|
+| Event log | embedded and server | durable timer/run history | `kron.aof` |
+| Audit log | server security | authenticated security decisions | `kron.audit.jsonl` |
+
+The embedded event log is the operational source of truth for timers:
+
+- timer creation;
+- due runs;
+- started runs;
+- successful runs;
+- failed runs;
+- retry decisions;
+- dead runs;
+- orphaned timer metadata after restart.
+
+This gives embedded applications a local, queryable history without Redis,
+RabbitMQ, Postgres, or an external scheduler server.
+
+The server audit log is append-only and tamper-evident:
+
+- every record has `seq`, `prev_hash`, and `hash`;
+- each hash covers the full audit record except `hash`;
+- each record points to the previous record hash;
+- `kron audit verify` validates the chain from the beginning;
+- `kron audit tail` streams audit decisions;
+- `kron audit query` filters by actor, action, and time range.
+
+Together, these logs make Kron observable in two directions: what happened to
+timers, and who did what through the server API.
+
+---
+
 ## Retry And Idempotency
 
 Retries are part of the runtime.
@@ -805,6 +882,7 @@ Server mode supports:
 - tenant-scoped timer visibility;
 - tenant-scoped worker polling;
 - append-only JSONL audit events;
+- tamper-evident audit hash chain;
 - separate public API and Raft API listeners.
 
 Roles:
@@ -823,10 +901,38 @@ Audit path:
 .kron/kron.audit.jsonl
 ```
 
+Audit records include:
+
+```text
+seq
+prev_hash
+hash
+```
+
+Each record hash is chained to the previous record:
+
+```text
+hash = SHA256(canonical JSON of every audit field except hash)
+```
+
+The hash input covers `prev_hash`, `seq`, `ts`, `node_id`, `actor`, `role`,
+`tenant_id`, `action`, `outcome`, `status`, and `reason`.
+
+Audit CLI:
+
+```bash
+kron audit verify
+kron audit tail
+kron audit tail --no-follow --limit 50
+kron audit query --actor "tenant-a-worker"
+kron audit query --action "worker.poll" --from "2026-06-01" --to "2026-06-10"
+```
+
 Example audit event:
 
 ```json
 {
+  "seq": 1042,
   "ts": "2026-06-10T10:00:00Z",
   "node_id": "n1",
   "action": "worker.poll",
@@ -834,7 +940,9 @@ Example audit event:
   "status": 200,
   "actor": "tenant-a-worker",
   "role": "worker",
-  "tenant_id": "tenant-a"
+  "tenant_id": "tenant-a",
+  "prev_hash": "9d1e...",
+  "hash": "13a7..."
 }
 ```
 
@@ -894,7 +1002,7 @@ pytest -q tests/python                                      PASS
 Observed results:
 
 ```text
-Rust core unit tests:             33 passed
+Rust core unit tests:             35 passed
 Rust integration tests:           17 passed
 Manual core stress test:           1 passed
 Python integration tests:         20 passed
@@ -919,7 +1027,7 @@ Stress areas covered:
 | Leader failover | leader kill, new election, write after failover |
 | Worker recovery | abandoned run is reclaimed after leader kill and lease expiry |
 | Fencing tokens | stale worker completions are rejected |
-| Security model | RBAC role rules and tenant matching are tested |
+| Security model | RBAC role rules, tenant matching, and audit hash-chain verification are tested |
 | Python async wrapper | async start/status/list/shutdown wrapper behavior |
 
 The manual stress command exercises the embedded scheduler with 1000 due timers:

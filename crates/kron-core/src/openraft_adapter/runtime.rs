@@ -17,6 +17,7 @@ use openraft::{BasicNode, Config, Raft};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::audit::{self, AuditRecord};
 use crate::cluster::{
     CreateTimerRequest, DistributedSummary, DistributedTimerSpec, JoinRequest, LeaveRequest,
     RaftCommand, RunCompleteRequest, RunFailRequest, TimerTarget, WorkerPollRequest,
@@ -94,6 +95,7 @@ pub struct OpenRaftCluster {
     store: KronRaftFileStore,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     claim_lock: Arc<Mutex<()>>,
+    audit_state: Arc<Mutex<audit::AuditState>>,
     _lock_file: Arc<File>,
 }
 
@@ -174,6 +176,7 @@ impl OpenRaftCluster {
                 .await
                 .map_err(|err| KronError::IpcUnavailable(err.to_string()))?;
         }
+        let audit_state = audit::read_last_state(&data_dir)?;
         let cluster = Self {
             node_id,
             node_name,
@@ -185,6 +188,7 @@ impl OpenRaftCluster {
             store,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             claim_lock: Arc::new(Mutex::new(())),
+            audit_state: Arc::new(Mutex::new(audit_state)),
             _lock_file: Arc::new(lock_file),
         };
         cluster.write_local_metadata()?;
@@ -974,14 +978,16 @@ where
     let auth = match authenticate(&cluster, headers) {
         Ok(auth) if auth.role.allows(required_role) => auth,
         Ok(auth) => {
-            audit(
+            if let Err(err) = audit(
                 &cluster,
                 Some(&auth),
                 action,
                 "forbidden",
                 StatusCode::FORBIDDEN.as_u16(),
                 Some(required_role.as_str()),
-            );
+            ) {
+                return audit_error(err);
+            }
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "forbidden", "required_role": required_role.as_str()})),
@@ -989,14 +995,16 @@ where
                 .into_response();
         }
         Err(reason) => {
-            audit(
+            if let Err(err) = audit(
                 &cluster,
                 None,
                 action,
                 "unauthorized",
                 StatusCode::UNAUTHORIZED.as_u16(),
                 Some(&reason),
-            );
+            ) {
+                return audit_error(err);
+            }
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "unauthorized"})),
@@ -1006,14 +1014,16 @@ where
     };
     match f(auth.clone()).await {
         Ok(value) => {
-            audit(
+            if let Err(err) = audit(
                 &cluster,
                 Some(&auth),
                 action,
                 "ok",
                 StatusCode::OK.as_u16(),
                 None,
-            );
+            ) {
+                return audit_error(err);
+            }
             (StatusCode::OK, Json(serde_json::to_value(value).unwrap())).into_response()
         }
         Err(err) => {
@@ -1029,17 +1039,30 @@ where
             } else {
                 StatusCode::BAD_REQUEST
             };
-            audit(
+            if let Err(err) = audit(
                 &cluster,
                 Some(&auth),
                 action,
                 "error",
                 status.as_u16(),
                 value.get("error").and_then(|v| v.as_str()),
-            );
+            ) {
+                return audit_error(err);
+            }
             (status, Json(value)).into_response()
         }
     }
+}
+
+fn audit_error(err: KronError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "audit_write_failed",
+            "message": err.to_string()
+        })),
+    )
+        .into_response()
 }
 
 fn authenticate(cluster: &OpenRaftCluster, headers: &HeaderMap) -> Result<AuthContext, String> {
@@ -1084,19 +1107,29 @@ fn audit(
     outcome: &str,
     status: u16,
     reason: Option<&str>,
-) {
-    let event = serde_json::json!({
-        "ts": Utc::now(),
-        "node_id": cluster.node_name,
-        "action": action,
-        "outcome": outcome,
-        "status": status,
-        "actor": auth.map(|ctx| ctx.actor.as_str()).unwrap_or("anonymous"),
-        "role": auth.map(|ctx| ctx.role.as_str()).unwrap_or("none"),
-        "tenant_id": auth.and_then(|ctx| ctx.tenant_id.as_deref()),
-        "reason": reason,
-    });
-    let path = cluster.data_dir.join("kron.audit.jsonl");
+) -> Result<(), KronError> {
+    let mut state = cluster.audit_state.lock().unwrap();
+    let prev_hash = state.hash.clone();
+    let mut record = AuditRecord {
+        seq: state.seq + 1,
+        ts: Utc::now(),
+        node_id: cluster.node_name.clone(),
+        action: action.to_string(),
+        outcome: outcome.to_string(),
+        status,
+        actor: auth
+            .map(|ctx| ctx.actor.clone())
+            .unwrap_or_else(|| "anonymous".to_string()),
+        role: auth
+            .map(|ctx| ctx.role.as_str().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        tenant_id: auth.and_then(|ctx| ctx.tenant_id.clone()),
+        reason: reason.map(str::to_string),
+        prev_hash,
+        hash: String::new(),
+    };
+    record.hash = audit::compute_hash(&record);
+    let path = audit::audit_path(&cluster.data_dir);
     use std::io::Write;
     #[cfg(unix)]
     let file = {
@@ -1109,10 +1142,13 @@ fn audit(
     };
     #[cfg(not(unix))]
     let file = OpenOptions::new().create(true).append(true).open(&path);
-    if let Ok(mut file) = file {
-        let _ = writeln!(file, "{event}");
-        let _ = file.sync_data();
-    }
+    let mut file = file?;
+    let encoded = serde_json::to_string(&record)?;
+    writeln!(file, "{encoded}")?;
+    file.sync_data()?;
+    state.seq = record.seq;
+    state.hash = record.hash;
+    Ok(())
 }
 
 fn tenant_matches(request_tenant: Option<&str>, resource_tenant: Option<&str>) -> bool {

@@ -119,6 +119,7 @@ Distributed mode appends security-relevant API decisions to:
 
 Each JSON line includes:
 
+- sequence number;
 - timestamp;
 - node id;
 - actor/token name;
@@ -128,6 +129,35 @@ Each JSON line includes:
 - outcome;
 - HTTP-style status;
 - reason when available.
+- `prev_hash`;
+- `hash`.
+
+Audit records are hash-chained:
+
+```text
+hash = SHA256(canonical JSON of every audit field except hash)
+```
+
+The canonical hash input includes `prev_hash`, `seq`, `ts`, `node_id`, `actor`,
+`role`, `tenant_id`, `action`, `outcome`, `status`, and `reason`.
+
+The first record uses an empty `prev_hash`. Every following record stores the
+previous record's `hash` as its `prev_hash`.
+
+Verify the chain:
+
+```bash
+kron audit verify
+```
+
+Inspect records:
+
+```bash
+kron audit tail
+kron audit tail --no-follow --limit 50
+kron audit query --actor "tenant-a-worker"
+kron audit query --action "worker.poll" --from "2026-06-01" --to "2026-06-10"
+```
 
 This is designed to be easy to ship into a SIEM or log pipeline. It is not yet a
 compliance-certified immutable audit subsystem.
