@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kron-core",
+    "crates/kron-cli",
+    "crates/kron-py",
+]
+
+[workspace.dependencies]
+chrono     = { version = "0.4", features = ["serde"] }
+chrono-tz  = { version = "0.9", features = ["serde"] }
+serde      = { version = "1",   features = ["derive"] }
+serde_json = "1"
+cron       = "0.12"
+ulid       = "1"
+thiserror  = "1"
+tokio      = { version = "1", features = ["full"] }
+tempfile   = "3"
+fs2        = "0.4"
+pyo3       = { version = "0.22", features = ["extension-module", "chrono"] }
+clap       = { version = "4", features = ["derive"] }
+proptest   = "1"
+criterion  = "0.5"
+openraft   = { version = "=0.9.24", features = ["serde", "storage-v2"] }
+axum       = "0.7"
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

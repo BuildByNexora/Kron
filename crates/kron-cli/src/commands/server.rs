@@ -1,0 +1,178 @@
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+
+use clap::Subcommand;
+use kron_core::ipc;
+use kron_core::openraft_adapter::runtime::{self, OpenRaftCluster};
+
+#[derive(Subcommand)]
+pub enum ServerCommand {
+    Start {
+        #[arg(long, default_value = "n1")]
+        node_id: String,
+        #[arg(long, default_value = "127.0.0.1:7379")]
+        http: String,
+        #[arg(long, default_value = "127.0.0.1:7380")]
+        raft: String,
+        #[arg(long)]
+        leader_id: Option<String>,
+        #[arg(long)]
+        cluster_token: Option<String>,
+    },
+    Status,
+    Shutdown,
+    Join {
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        http: String,
+        #[arg(long)]
+        raft: String,
+    },
+    Leave {
+        #[arg(long)]
+        node_id: String,
+    },
+}
+
+pub fn run(command: ServerCommand, data_dir: &Path) -> Result<(), String> {
+    match command {
+        ServerCommand::Start {
+            node_id,
+            http,
+            raft,
+            leader_id,
+            cluster_token,
+        } => start(data_dir, node_id, http, raft, leader_id, cluster_token),
+        ServerCommand::Status => {
+            let value = request(
+                data_dir,
+                "GET",
+                "/v1/cluster/status",
+                serde_json::Value::Null,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        ServerCommand::Shutdown => {
+            let value = request(
+                data_dir,
+                "POST",
+                "/v1/runtime/shutdown",
+                serde_json::Value::Object(Default::default()),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        ServerCommand::Join {
+            node_id,
+            http,
+            raft,
+        } => {
+            let value = request(
+                data_dir,
+                "POST",
+                "/v1/cluster/join",
+                serde_json::json!({
+                    "node_id": node_id,
+                    "http_addr": http,
+                    "raft_addr": raft,
+                }),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        ServerCommand::Leave { node_id } => {
+            let value = request(
+                data_dir,
+                "POST",
+                "/v1/cluster/leave",
+                serde_json::json!({ "node_id": node_id }),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn start(
+    data_dir: &Path,
+    node_id: String,
+    http: String,
+    raft: String,
+    leader_id: Option<String>,
+    cluster_token: Option<String>,
+) -> Result<(), String> {
+    let bootstrap_single_node = leader_id
+        .as_deref()
+        .map(|leader| leader == node_id)
+        .unwrap_or(true);
+    let token = match cluster_token {
+        Some(token) => token,
+        None => runtime::server_token(data_dir).map_err(|e| e.to_string())?,
+    };
+    println!("kron server listening on http://{http}");
+    println!("token: {}", ipc::token_path(data_dir).display());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async move {
+        let cluster =
+            OpenRaftCluster::open(data_dir, node_id, http, raft, token, bootstrap_single_node)
+                .await
+                .map_err(|e| e.to_string())?;
+        std::sync::Arc::new(cluster)
+            .serve()
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+pub fn request(
+    data_dir: &Path,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let endpoint = std::fs::read_to_string(data_dir.join("kron.http"))
+        .map_err(|_| "server endpoint not found; is `kron server start` running?".to_string())?;
+    let token = std::fs::read_to_string(ipc::token_path(data_dir))
+        .map_err(|_| "server token not found".to_string())?;
+    let body = if body.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string(&body).map_err(|e| e.to_string())?
+    };
+    let mut stream = TcpStream::connect(endpoint.trim()).map_err(|e| e.to_string())?;
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        endpoint.trim(),
+        token.trim(),
+        body.len(),
+        body
+    )
+    .map_err(|e| e.to_string())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| e.to_string())?;
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "invalid HTTP response".to_string())?;
+    serde_json::from_str(body).map_err(|e| e.to_string())
+}

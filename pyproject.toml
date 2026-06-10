@@ -1,0 +1,39 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kron"
+version = "0.1.0"
+description = "Embedded application time engine"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "Kron contributors" }]
+keywords = ["cron", "scheduler", "jobs", "embedded", "rust"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/kron/kron"
+Repository = "https://github.com/kron/kron"
+Issues = "https://github.com/kron/kron/issues"
+
+[tool.maturin]
+manifest-path = "crates/kron-py/Cargo.toml"
+module-name = "kron"
+features = ["pyo3/extension-module"]
