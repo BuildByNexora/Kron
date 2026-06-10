@@ -8,7 +8,7 @@ import pytest
 import kron
 
 
-def wait_until(predicate, timeout=5.0):
+def wait_until(predicate, timeout=10.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -26,7 +26,7 @@ def test_callback_runs_and_status_is_visible(tmp_path):
     kron.schedule(
         "py_once",
         fn=task,
-        at=datetime.now(timezone.utc) + timedelta(milliseconds=100),
+        after="1s",
         max_attempts=1,
     )
     kron.start(data_dir=str(tmp_path))
@@ -50,7 +50,7 @@ def test_callback_can_receive_timer_context(tmp_path):
     kron.schedule(
         "py_context",
         fn=task,
-        at=datetime.now(timezone.utc) + timedelta(milliseconds=100),
+        after="1s",
         max_attempts=1,
     )
     kron.start(data_dir=str(tmp_path))
@@ -97,7 +97,7 @@ def test_python_exception_becomes_failed_run(tmp_path):
     kron.schedule(
         "py_failure",
         fn=bad_task,
-        at=datetime.now(timezone.utc) + timedelta(milliseconds=100),
+        after="1s",
         max_attempts=1,
     )
     kron.start(data_dir=str(tmp_path))

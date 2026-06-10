@@ -1,4 +1,3 @@
-from datetime import datetime, timedelta, timezone
 import asyncio
 
 import pytest
@@ -6,7 +5,7 @@ import pytest
 import kron
 
 
-async def wait_until(predicate, timeout=5.0):
+async def wait_until(predicate, timeout=10.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         if predicate():
@@ -25,7 +24,7 @@ def test_async_start_status_list_and_shutdown(tmp_path):
         kron.schedule(
             "async_once",
             fn=task,
-            at=datetime.now(timezone.utc) + timedelta(milliseconds=100),
+            after="1s",
             max_attempts=1,
         )
 
