@@ -436,6 +436,40 @@ async fn ipc_tcp_fallback_uses_token_and_rejects_bad_token() {
     let _ = ipc_join.join();
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipc_falls_back_to_tcp_when_unix_socket_path_is_too_long() {
+    let root = TempDir::new().unwrap();
+    let long_dir = root.path().join("a".repeat(120));
+    std::fs::create_dir_all(&long_dir).unwrap();
+    let engine = Arc::new(Engine::open(&long_dir).unwrap());
+    engine
+        .schedule(
+            "long_socket_timer",
+            Schedule::Every { seconds: 60 },
+            Arc::new(FnTimer::new("long_socket_fn", |_, _| Ok(()))),
+            Some(RetryPolicy::no_retry()),
+            None,
+        )
+        .unwrap();
+    engine.start().unwrap();
+    let ipc_join = ipc::start_server(Arc::clone(&engine)).unwrap();
+
+    let response = ipc::request(
+        &long_dir,
+        &IpcRequest::Status {
+            name: "long_socket_timer".into(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, IpcResponse::Ok { .. }));
+    assert!(ipc::port_path(&long_dir).exists());
+
+    engine.shutdown(StdDuration::from_secs(1)).await.unwrap();
+    let _ = std::fs::remove_file(ipc::port_path(&long_dir));
+    let _ = ipc_join.join();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_replays_new_aof_tail_after_compaction() {
     let dir = TempDir::new().unwrap();

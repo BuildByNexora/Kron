@@ -66,7 +66,11 @@ pub fn start_server(engine: Arc<Engine>) -> Result<std::thread::JoinHandle<()>, 
 
         let path = socket_path(engine.data_dir());
         let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path)?;
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(err) if is_unix_socket_path_too_long(&err) => return Ok(tcp),
+            Err(err) => return Err(err.into()),
+        };
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
 
@@ -97,6 +101,15 @@ pub fn start_server(engine: Arc<Engine>) -> Result<std::thread::JoinHandle<()>, 
     {
         Ok(tcp)
     }
+}
+
+#[cfg(unix)]
+fn is_unix_socket_path_too_long(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::InvalidInput
+        && err
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("path must be shorter")
 }
 
 pub fn request(data_dir: &Path, request: &IpcRequest) -> Result<IpcResponse, KronError> {

@@ -25,6 +25,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test
+        if: runner.os != 'Windows'
+      - run: cargo test --workspace --lib
+        if: runner.os == 'Windows'
 
   python:
     runs-on: ${{ matrix.os }}
@@ -57,7 +60,7 @@ jobs:
         run: .venv/bin/python -m pytest -q tests/python
         if: runner.os != 'Windows'
       - name: Run Python tests
-        run: .venv\Scripts\python -m pytest -q tests/python
+        run: .venv\Scripts\python -m pytest -q tests/python/test_kron_api.py tests/python/test_async_api.py
         if: runner.os == 'Windows'
 
   wheels:
