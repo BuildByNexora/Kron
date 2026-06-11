@@ -128,6 +128,7 @@ mod tests {
             retry: RetryPolicy::no_retry(),
             timezone: "UTC".to_string(),
             created_at: Utc::now(),
+            overlap: Default::default(),
         }
     }
 

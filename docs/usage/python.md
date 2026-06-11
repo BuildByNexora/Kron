@@ -47,11 +47,31 @@ The v0.1 context is intentionally small. Future versions may add attempt metadat
 
 ## Public API Contract
 
-- `kron.schedule(name, fn=callable, cron=... | every=... | after=... | at=..., timezone="UTC", max_attempts=3)` registers or re-registers a timer.
+- `kron.schedule(name, fn=callable, cron=... | every=... | after=... | at=..., timezone="UTC", max_attempts=3, overlap="delay")` registers or re-registers a timer.
 - `kron.start(data_dir=".kron")` opens storage, starts the runtime in a background thread, and fails if another writer owns the data directory.
 - `kron.shutdown(timeout=5.0)` is safe to call even when the runtime is not started.
 - `kron.status(name)` returns a dictionary or `None`.
 - `kron.list()` returns a list of timer dictionaries.
+
+## Overlap Control
+
+Use `overlap="skip"` when a timer should not start a new invocation while the
+previous one is still running:
+
+```python
+kron.schedule(
+    "long_import",
+    every="10m",
+    fn=long_import,
+    overlap="skip",
+)
+```
+
+Supported values:
+
+- `delay`: default behavior; schedule from the previous finish time.
+- `skip`: keep the schedule, but write `RUN_SKIPPED_OVERLAP` if the timer is still running.
+- `allow`: allow concurrent invocations of the same timer.
 
 ## Asyncio Wrapper
 

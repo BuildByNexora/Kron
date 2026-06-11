@@ -143,6 +143,33 @@ External side effects should be idempotent.
 
 ---
 
+## Overlap Control
+
+Kron can prevent multiple copies of the same timer from running at once.
+
+```python
+kron.schedule(
+    "sync_reports",
+    every="10m",
+    fn=sync_reports,
+    overlap="skip",
+)
+```
+
+Overlap policies:
+
+| Policy | Behavior |
+|---|---|
+| `delay` | Default. Wait for the current run to finish, then schedule the next run from that finish time. |
+| `skip` | Keep the wall-clock schedule, but skip a due run if the previous run is still active. The skip is written to history. |
+| `allow` | Allow concurrent runs of the same timer. |
+
+Use `overlap="skip"` for jobs such as imports, report generation, billing sync,
+or cache refreshes where a second copy should not start while the first one is
+still running.
+
+---
+
 ## CLI
 
 ```bash

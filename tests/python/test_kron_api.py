@@ -117,6 +117,14 @@ def test_shutdown_is_noop_when_not_started():
     kron.shutdown()
 
 
+def test_schedule_rejects_unknown_overlap_policy():
+    def task():
+        pass
+
+    with pytest.raises(ValueError, match="overlap must be one of"):
+        kron.schedule("bad_overlap", fn=task, after="1s", overlap="sometimes")
+
+
 def test_lock_conflict_mentions_socket(tmp_path):
     kron.start(data_dir=str(tmp_path))
     try:

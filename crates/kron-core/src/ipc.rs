@@ -387,6 +387,7 @@ pub fn history(
             | Event::TimerCancelled { timer_id, .. }
             | Event::RunDue { timer_id, .. }
             | Event::RunStarted { timer_id, .. }
+            | Event::RunSkippedOverlap { timer_id, .. }
             | Event::RunSucceeded { timer_id, .. }
             | Event::RunFailed { timer_id, .. }
             | Event::RunRetrying { timer_id, .. }

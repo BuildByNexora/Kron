@@ -18,7 +18,7 @@ use crate::retry::RetryPolicy;
 use crate::schedule::Schedule;
 use crate::snapshot;
 use crate::state::EngineState;
-use crate::timer::{RunId, TimerId, TimerSpec, TimerState, TimerSummary};
+use crate::timer::{OverlapPolicy, RunId, TimerId, TimerSpec, TimerState, TimerSummary};
 
 // ---------------------------------------------------------------------------
 // Function registry — maps TimerId → host callable
@@ -188,6 +188,18 @@ impl Engine {
         retry: Option<RetryPolicy>,
         timezone: Option<String>,
     ) -> Result<(), KronError> {
+        self.schedule_with_overlap(id, schedule, fn_impl, retry, timezone, None)
+    }
+
+    pub fn schedule_with_overlap(
+        &self,
+        id: impl Into<String>,
+        schedule: Schedule,
+        fn_impl: Arc<dyn TimerFn>,
+        retry: Option<RetryPolicy>,
+        timezone: Option<String>,
+        overlap: Option<OverlapPolicy>,
+    ) -> Result<(), KronError> {
         let id = TimerId::new(id);
         let fn_name = fn_impl.name();
         let tz = timezone.unwrap_or_else(|| "UTC".to_string());
@@ -210,6 +222,9 @@ impl Engine {
                 .get(&id)
                 .map(|spec| spec.created_at)
                 .unwrap_or_else(Utc::now),
+            overlap: overlap
+                .or_else(|| inner.state.specs.get(&id).map(|spec| spec.overlap))
+                .unwrap_or_default(),
         };
 
         if is_new {
@@ -396,6 +411,32 @@ async fn run_timer(inner: Arc<Mutex<Inner>>, scheduled: ScheduledTimer) {
         let now = Utc::now();
         guard.state.next_runs.remove(&timer_id);
 
+        let spec = match guard.state.specs.get(&timer_id).cloned() {
+            Some(spec) => spec,
+            None => {
+                finish_run(&mut guard);
+                return;
+            }
+        };
+
+        if spec.overlap == OverlapPolicy::Skip
+            && matches!(guard.state.states.get(&timer_id), Some(TimerState::Running))
+        {
+            let event = Event::RunSkippedOverlap {
+                timer_id: timer_id.clone(),
+                run_id,
+                scheduled_at: scheduled.next_run_at,
+                skipped_at: now,
+            };
+            if append_apply_or_stop(&mut guard, event, now).is_err() {
+                finish_run(&mut guard);
+                return;
+            }
+            reschedule_from(&mut guard, &spec, scheduled.next_run_at);
+            finish_run(&mut guard);
+            return;
+        }
+
         let due_event = Event::RunDue {
             timer_id: timer_id.clone(),
             run_id: run_id.clone(),
@@ -418,17 +459,10 @@ async fn run_timer(inner: Arc<Mutex<Inner>>, scheduled: ScheduledTimer) {
         }
 
         let fn_impl = guard.registry.get(&timer_id).cloned();
-        let spec = guard.state.specs.get(&timer_id).cloned();
-        (fn_impl, run_id, spec, now)
-    };
-
-    let spec = match spec {
-        Some(s) => s,
-        None => {
-            let mut guard = inner.lock().unwrap();
-            finish_run(&mut guard);
-            return;
+        if matches!(spec.overlap, OverlapPolicy::Skip | OverlapPolicy::Allow) {
+            reschedule_from(&mut guard, &spec, scheduled.next_run_at);
         }
+        (fn_impl, run_id, spec, now)
     };
 
     let missing_function = fn_impl.is_none();
@@ -461,12 +495,17 @@ async fn run_timer(inner: Arc<Mutex<Inner>>, scheduled: ScheduledTimer) {
                 return;
             }
 
-            // Re-enqueue for the next fire.
-            reschedule(&mut guard, &spec, now);
+            if spec.overlap == OverlapPolicy::Delay {
+                reschedule(&mut guard, &spec, now);
+            }
         }
 
         Err(err) => {
             if missing_function {
+                if spec.overlap != OverlapPolicy::Delay {
+                    guard.heap.remove_timer(&spec.id);
+                    guard.state.next_runs.remove(&spec.id);
+                }
                 guard.state.mark_function_missing(&spec.id);
             } else {
                 let attempt = guard
@@ -490,6 +529,10 @@ async fn run_timer(inner: Arc<Mutex<Inner>>, scheduled: ScheduledTimer) {
                 // Check retry policy.
                 match spec.retry.next_retry_at(now, attempt) {
                     Some(retry_at) => {
+                        if spec.overlap != OverlapPolicy::Delay {
+                            guard.heap.remove_timer(&spec.id);
+                            guard.state.next_runs.remove(&spec.id);
+                        }
                         let ev = Event::RunRetrying {
                             timer_id: spec.id.clone(),
                             run_id: run_id.clone(),
@@ -521,9 +564,9 @@ async fn run_timer(inner: Arc<Mutex<Inner>>, scheduled: ScheduledTimer) {
                             finish_run(&mut guard);
                             return;
                         }
-                        // For recurring timers, still reschedule the next occurrence
-                        // even if this run died.
-                        if !spec.schedule.is_one_shot() {
+                        // For recurring timers in delay mode, still reschedule
+                        // the next occurrence even if this run died.
+                        if spec.overlap == OverlapPolicy::Delay && !spec.schedule.is_one_shot() {
                             reschedule(&mut guard, &spec, now);
                         }
                     }
@@ -554,10 +597,14 @@ fn append_apply_or_stop(
 }
 
 fn reschedule(inner: &mut Inner, spec: &TimerSpec, now: chrono::DateTime<Utc>) {
+    reschedule_from(inner, spec, now);
+}
+
+fn reschedule_from(inner: &mut Inner, spec: &TimerSpec, from: chrono::DateTime<Utc>) {
     if inner.runtime.shutting_down || inner.runtime.stopped {
         return;
     }
-    if let Ok(Some(next)) = spec.schedule.next_run_after(now, &spec.timezone) {
+    if let Ok(Some(next)) = spec.schedule.next_run_after(from, &spec.timezone) {
         inner.state.next_runs.insert(spec.id.clone(), next);
         inner.heap.push(ScheduledTimer {
             timer_id: spec.id.clone(),

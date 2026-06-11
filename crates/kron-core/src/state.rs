@@ -84,6 +84,23 @@ impl EngineState {
                 self.states.insert(timer_id.clone(), TimerState::Running);
             }
 
+            Event::RunSkippedOverlap {
+                timer_id,
+                run_id,
+                skipped_at,
+                ..
+            } => {
+                self.last_runs.insert(
+                    timer_id.clone(),
+                    LastRunInfo {
+                        run_id: run_id.clone(),
+                        finished_at: *skipped_at,
+                        duration_ms: None,
+                        status: "SKIPPED_OVERLAP".to_string(),
+                    },
+                );
+            }
+
             Event::RunSucceeded {
                 timer_id,
                 run_id,

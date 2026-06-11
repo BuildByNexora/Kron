@@ -38,6 +38,7 @@ fn bench_snapshot(c: &mut Criterion) {
                 retry: RetryPolicy::no_retry(),
                 timezone: "UTC".to_string(),
                 created_at: Utc::now(),
+                overlap: Default::default(),
             },
         );
     }

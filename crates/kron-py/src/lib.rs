@@ -16,7 +16,7 @@ use kron_core::error::KronError;
 use kron_core::ipc;
 use kron_core::retry::RetryPolicy;
 use kron_core::schedule::{parse_duration_str, Schedule};
-use kron_core::timer::{RunId, TimerId, TimerState, TimerSummary};
+use kron_core::timer::{OverlapPolicy, RunId, TimerId, TimerState, TimerSummary};
 use kron_core::Engine;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -49,6 +49,7 @@ struct PendingRegistration {
     function_name: String,
     retry: RetryPolicy,
     timezone: String,
+    overlap: OverlapPolicy,
 }
 
 struct PyTimerFn {
@@ -149,6 +150,7 @@ fn schedule(_py: Python<'_>, name: String, kwargs: Option<&Bound<'_, PyDict>>) -
         ..Default::default()
     };
     let schedule = parse_schedule(kwargs)?;
+    let overlap = parse_overlap(kwargs)?;
 
     let registration = PendingRegistration {
         name,
@@ -157,6 +159,7 @@ fn schedule(_py: Python<'_>, name: String, kwargs: Option<&Bound<'_, PyDict>>) -
         function_name,
         retry,
         timezone,
+        overlap,
     };
 
     let mut state = global()
@@ -813,7 +816,7 @@ fn json_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
 
 fn apply_registration(engine: &Arc<Engine>, registration: PendingRegistration) -> PyResult<()> {
     engine
-        .schedule(
+        .schedule_with_overlap(
             registration.name,
             registration.schedule,
             Arc::new(PyTimerFn::new(
@@ -822,6 +825,7 @@ fn apply_registration(engine: &Arc<Engine>, registration: PendingRegistration) -
             )),
             Some(registration.retry),
             Some(registration.timezone),
+            Some(registration.overlap),
         )
         .map_err(map_kron_error)
 }
@@ -884,6 +888,18 @@ fn get_optional_string(kwargs: &Bound<'_, PyDict>, key: &str) -> PyResult<Option
         .get_item(key)?
         .map(|value| value.extract::<String>())
         .transpose()
+}
+
+fn parse_overlap(kwargs: &Bound<'_, PyDict>) -> PyResult<OverlapPolicy> {
+    let value = get_optional_string(kwargs, "overlap")?.unwrap_or_else(|| "delay".to_string());
+    match value.as_str() {
+        "delay" => Ok(OverlapPolicy::Delay),
+        "skip" => Ok(OverlapPolicy::Skip),
+        "allow" => Ok(OverlapPolicy::Allow),
+        _ => Err(PyValueError::new_err(
+            "overlap must be one of: delay, skip, allow",
+        )),
+    }
 }
 
 fn resolve_data_dir(py: Python<'_>, explicit: Option<String>) -> PyResult<PathBuf> {

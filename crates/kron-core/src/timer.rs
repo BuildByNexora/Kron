@@ -52,6 +52,20 @@ impl std::fmt::Display for RunId {
 // Timer specification — immutable intent
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlapPolicy {
+    /// Preserve the existing behavior: schedule the next recurring run after the
+    /// current run finishes.
+    #[default]
+    Delay,
+    /// Keep wall-clock cadence, but skip a due run if the previous run is still
+    /// running.
+    Skip,
+    /// Keep wall-clock cadence and allow multiple runs of the same timer.
+    Allow,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimerSpec {
     pub id: TimerId,
@@ -59,6 +73,8 @@ pub struct TimerSpec {
     pub retry: RetryPolicy,
     pub timezone: String, // IANA tz name e.g. "Europe/Rome"
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub overlap: OverlapPolicy,
 }
 
 // ---------------------------------------------------------------------------

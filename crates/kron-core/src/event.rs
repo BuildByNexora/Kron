@@ -40,6 +40,12 @@ pub enum Event {
         started_at: DateTime<Utc>,
         attempt: u32,
     },
+    RunSkippedOverlap {
+        timer_id: TimerId,
+        run_id: RunId,
+        scheduled_at: DateTime<Utc>,
+        skipped_at: DateTime<Utc>,
+    },
     RunSucceeded {
         timer_id: TimerId,
         run_id: RunId,
@@ -102,6 +108,7 @@ mod tests {
                 retry: RetryPolicy::no_retry(),
                 timezone: "UTC".to_string(),
                 created_at: Utc::now(),
+                overlap: Default::default(),
             },
         };
         let encoded = serde_json::to_string(&event).unwrap();

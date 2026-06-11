@@ -13,7 +13,7 @@ use kron_core::ipc::{self, IpcRequest, IpcResponse};
 use kron_core::log::AppendOnlyLog;
 use kron_core::retry::{BackoffStrategy, RetryPolicy};
 use kron_core::schedule::Schedule;
-use kron_core::timer::TimerState;
+use kron_core::timer::{OverlapPolicy, TimerState};
 use kron_core::Engine;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
@@ -233,6 +233,79 @@ async fn shutdown_stops_future_runs() {
         engine.start().unwrap_err(),
         KronError::AlreadyStopped
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skip_overlap_records_skipped_run_while_previous_run_is_active() {
+    let dir = TempDir::new().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = Engine::open(dir.path()).unwrap();
+
+    let calls_for_fn = Arc::clone(&calls);
+    engine
+        .schedule_with_overlap(
+            "non_overlapping",
+            Schedule::Every { seconds: 1 },
+            Arc::new(FnTimer::new("non_overlapping_fn", move |_, _| {
+                calls_for_fn.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(StdDuration::from_millis(1800));
+                Ok(())
+            })),
+            Some(RetryPolicy::no_retry()),
+            None,
+            Some(OverlapPolicy::Skip),
+        )
+        .unwrap();
+
+    engine.start().unwrap();
+
+    wait_until_with_timeout(
+        || {
+            replay_events(&dir)
+                .iter()
+                .any(|entry| matches!(entry.event, Event::RunSkippedOverlap { .. }))
+        },
+        StdDuration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    engine.shutdown(StdDuration::from_secs(3)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn allow_overlap_can_run_same_timer_concurrently() {
+    let dir = TempDir::new().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let engine = Engine::open(dir.path()).unwrap();
+
+    let active_for_fn = Arc::clone(&active);
+    let max_for_fn = Arc::clone(&max_active);
+    engine
+        .schedule_with_overlap(
+            "overlapping",
+            Schedule::Every { seconds: 1 },
+            Arc::new(FnTimer::new("overlapping_fn", move |_, _| {
+                let now_active = active_for_fn.fetch_add(1, Ordering::SeqCst) + 1;
+                max_for_fn.fetch_max(now_active, Ordering::SeqCst);
+                thread::sleep(StdDuration::from_millis(1800));
+                active_for_fn.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })),
+            Some(RetryPolicy::no_retry()),
+            None,
+            Some(OverlapPolicy::Allow),
+        )
+        .unwrap();
+
+    engine.start().unwrap();
+    wait_until_with_timeout(
+        || max_active.load(Ordering::SeqCst) >= 2,
+        StdDuration::from_secs(5),
+    )
+    .await;
+    engine.shutdown(StdDuration::from_secs(5)).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
