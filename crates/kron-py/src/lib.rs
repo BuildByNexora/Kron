@@ -372,9 +372,9 @@ fn call_in_async_thread<'py>(
     loop_.call_method1("run_in_executor", (py.None(), partial))
 }
 
-#[pyclass]
+#[pyclass(unsendable)]
 struct Client {
-    server: String,
+    server: Mutex<String>,
     token: String,
 }
 
@@ -382,7 +382,10 @@ struct Client {
 impl Client {
     #[new]
     fn new(server: String, token: String) -> Self {
-        Self { server, token }
+        Self {
+            server: Mutex::new(normalize_server(&server)),
+            token,
+        }
     }
 
     #[pyo3(signature = (name, *, task, payload=None, cron=None, every=None, after=None, at=None, timezone=None, max_attempts=3))]
@@ -417,14 +420,14 @@ impl Client {
         });
         json_to_py(
             py,
-            http_request(&self.server, &self.token, "POST", "/v1/timers", body)?,
+            http_request_cached(&self.server, &self.token, "POST", "/v1/timers", body)?,
         )
     }
 
     fn list(&self, py: Python<'_>) -> PyResult<PyObject> {
         json_to_py(
             py,
-            http_request(
+            http_request_cached(
                 &self.server,
                 &self.token,
                 "GET",
@@ -437,7 +440,7 @@ impl Client {
     fn status(&self, py: Python<'_>, name: String) -> PyResult<PyObject> {
         json_to_py(
             py,
-            http_request(
+            http_request_cached(
                 &self.server,
                 &self.token,
                 "GET",
@@ -450,7 +453,7 @@ impl Client {
     fn history(&self, py: Python<'_>, name: String) -> PyResult<PyObject> {
         json_to_py(
             py,
-            http_request(
+            http_request_cached(
                 &self.server,
                 &self.token,
                 "GET",
@@ -461,9 +464,9 @@ impl Client {
     }
 }
 
-#[pyclass]
+#[pyclass(unsendable)]
 struct Worker {
-    server: String,
+    server: Mutex<String>,
     token: String,
     worker_id: String,
     tasks: Arc<Mutex<HashMap<String, Py<PyAny>>>>,
@@ -475,7 +478,7 @@ impl Worker {
     #[pyo3(signature = (server, token, worker_id=None))]
     fn new(server: String, token: String, worker_id: Option<String>) -> Self {
         Self {
-            server,
+            server: Mutex::new(normalize_server(&server)),
             token,
             worker_id: worker_id.unwrap_or_else(|| {
                 format!(
@@ -502,7 +505,7 @@ impl Worker {
             "tasks": tasks,
             "lease_seconds": 30,
         });
-        http_request(
+        http_request_cached(
             &self.server,
             &self.token,
             "POST",
@@ -522,7 +525,7 @@ impl Worker {
             "tasks": tasks,
         });
         let response = py.allow_threads(|| {
-            http_request_with_timeout(
+            http_request_cached_with_timeout(
                 &self.server,
                 &self.token,
                 "POST",
@@ -594,7 +597,7 @@ impl Worker {
                     "worker_id": self.worker_id,
                     "fencing_token": fencing_token,
                 });
-                http_request(
+                http_request_cached(
                     &self.server,
                     &self.token,
                     "POST",
@@ -609,7 +612,7 @@ impl Worker {
                     "fencing_token": fencing_token,
                     "error": error_text,
                 });
-                http_request(
+                http_request_cached(
                     &self.server,
                     &self.token,
                     "POST",
@@ -665,29 +668,97 @@ fn normalize_server(server: &str) -> String {
         .to_string()
 }
 
-fn http_request(
-    server: &str,
+fn http_request_cached(
+    server: &Mutex<String>,
     token: &str,
     method: &str,
     path: &str,
     body: serde_json::Value,
 ) -> PyResult<serde_json::Value> {
-    http_request_with_timeout(server, token, method, path, body, DEFAULT_HTTP_TIMEOUT)
+    http_request_cached_with_timeout(server, token, method, path, body, DEFAULT_HTTP_TIMEOUT)
 }
 
-fn http_request_with_timeout(
-    server: &str,
+fn http_request_cached_with_timeout(
+    server: &Mutex<String>,
     token: &str,
     method: &str,
     path: &str,
     body: serde_json::Value,
     timeout: StdDuration,
 ) -> PyResult<serde_json::Value> {
+    let current = server
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("server cache lock poisoned"))?
+        .clone();
+    let mut resolved = current.clone();
+    let value = http_request_follow_redirect_with_update(
+        &current,
+        token,
+        method,
+        path,
+        body,
+        timeout,
+        Some(&mut resolved),
+    )?;
+    if resolved != current {
+        *server
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("server cache lock poisoned"))? = resolved;
+    }
+    Ok(value)
+}
+
+fn http_request_follow_redirect_with_update(
+    server: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+    timeout: StdDuration,
+    mut resolved_server: Option<&mut String>,
+) -> PyResult<serde_json::Value> {
+    let mut current = normalize_server(server);
+    for attempt in 0..=1 {
+        let (status, value) = http_request_once(&current, token, method, path, &body, timeout)?;
+        if (200..300).contains(&status) {
+            return Ok(value);
+        }
+        if attempt == 0 && value.get("error").and_then(|v| v.as_str()) == Some("not_leader") {
+            if let Some(leader_http) = value.get("leader_http").and_then(|v| v.as_str()) {
+                if !leader_http.trim().is_empty() {
+                    current = normalize_server(leader_http);
+                    if let Some(resolved_server) = resolved_server.as_deref_mut() {
+                        *resolved_server = current.clone();
+                    }
+                    continue;
+                }
+            }
+        }
+        let message = value
+            .get("error")
+            .or_else(|| value.get("message"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("HTTP request failed");
+        return Err(PyRuntimeError::new_err(format!(
+            "HTTP {status} from {current}: {message}"
+        )));
+    }
+    Err(PyRuntimeError::new_err("leader redirect retry failed"))
+}
+
+fn http_request_once(
+    server: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+    timeout: StdDuration,
+) -> PyResult<(u16, serde_json::Value)> {
     let server = normalize_server(server);
     let body = if body.is_null() {
         String::new()
     } else {
-        serde_json::to_string(&body).map_err(|err| PyRuntimeError::new_err(err.to_string()))?
+        serde_json::to_string(body).map_err(|err| PyRuntimeError::new_err(err.to_string()))?
     };
     let addr = server
         .to_socket_addrs()
@@ -724,17 +795,7 @@ fn http_request_with_timeout(
         .ok_or_else(|| PyRuntimeError::new_err("invalid HTTP status line"))?;
     let parsed: serde_json::Value =
         serde_json::from_str(body).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    if !(200..300).contains(&status) {
-        let message = parsed
-            .get("error")
-            .or_else(|| parsed.get("message"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("HTTP request failed");
-        return Err(PyRuntimeError::new_err(format!(
-            "HTTP {status} from {server}: {message}"
-        )));
-    }
-    Ok(parsed)
+    Ok((status, parsed))
 }
 
 fn py_to_json(py: Python<'_>, value: PyObject) -> PyResult<serde_json::Value> {

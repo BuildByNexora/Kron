@@ -17,7 +17,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cluster::{DistributedSummary, DistributedTimerSpec, RaftCommand, WorkerRun};
+use crate::cluster::{DistributedSummary, DistributedTimerSpec, NodeInfo, RaftCommand, WorkerRun};
 use crate::openraft_adapter::{KronRaftResponse, KronTypeConfig};
 use crate::schedule::Schedule;
 use crate::timer::{RunId, TimerId, TimerState};
@@ -67,6 +67,7 @@ struct PersistedStateMachine {
     pending: VecDeque<WorkerRun>,
     active_runs: BTreeMap<String, PersistedActiveRun>,
     workers: BTreeMap<String, PersistedWorker>,
+    nodes: BTreeMap<String, NodeInfo>,
     history: Vec<serde_json::Value>,
 }
 
@@ -100,6 +101,7 @@ pub struct RaftAppState {
     pub history: Vec<serde_json::Value>,
     pub pending: VecDeque<WorkerRun>,
     pub active_runs: BTreeMap<String, PersistedActiveRun>,
+    pub nodes: BTreeMap<String, NodeInfo>,
 }
 
 impl Default for PersistedStateMachine {
@@ -112,6 +114,7 @@ impl Default for PersistedStateMachine {
             pending: VecDeque::new(),
             active_runs: BTreeMap::new(),
             workers: BTreeMap::new(),
+            nodes: BTreeMap::new(),
             history: Vec::new(),
         }
     }
@@ -214,6 +217,7 @@ impl KronRaftFileStore {
             history: inner.state_machine.history.clone(),
             pending: inner.state_machine.pending.clone(),
             active_runs: inner.state_machine.active_runs.clone(),
+            nodes: inner.state_machine.nodes.clone(),
         }
     }
 
@@ -633,7 +637,12 @@ fn apply_kron_command(state: &mut PersistedStateMachine, command: RaftCommand) {
         RaftCommand::UnregisterWorker { worker_id } => {
             state.workers.remove(&worker_id);
         }
-        RaftCommand::AddNode { .. } | RaftCommand::RemoveNode { .. } => {}
+        RaftCommand::AddNode { node } => {
+            state.nodes.insert(node.node_id.clone(), node);
+        }
+        RaftCommand::RemoveNode { node_id } => {
+            state.nodes.remove(&node_id);
+        }
     }
 }
 

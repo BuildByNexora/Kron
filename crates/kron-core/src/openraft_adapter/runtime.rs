@@ -15,12 +15,13 @@ use fs2::FileExt;
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use openraft::{BasicNode, Config, Raft};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 use crate::audit::{self, AuditRecord};
 use crate::cluster::{
     CreateTimerRequest, DistributedSummary, DistributedTimerSpec, JoinRequest, LeaveRequest,
-    RaftCommand, RunCompleteRequest, RunFailRequest, TimerTarget, WorkerPollRequest,
+    NodeInfo, RaftCommand, RunCompleteRequest, RunFailRequest, TimerTarget, WorkerPollRequest,
     WorkerRegisterRequest, WorkerRun,
 };
 use crate::error::KronError;
@@ -74,13 +75,20 @@ struct TokenFile {
     tokens: Vec<TokenEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TokenEntry {
     name: String,
+    #[serde(default)]
     token: String,
+    #[serde(default)]
+    token_sha256: Option<String>,
     role: AuthRole,
     #[serde(default)]
     tenant_id: Option<String>,
+    #[serde(default)]
+    not_before: Option<chrono::DateTime<Utc>>,
+    #[serde(default)]
+    expires_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -385,10 +393,24 @@ impl OpenRaftCluster {
     pub async fn join(&self, request: JoinRequest) -> Result<serde_json::Value, KronError> {
         self.ensure_leader().await?;
         let id = parse_node_id(&request.node_id);
+        let node = NodeInfo {
+            node_id: request.node_id.clone(),
+            http_addr: request.http_addr.clone(),
+            raft_addr: request.raft_addr.clone(),
+        };
         self.raft
-            .add_learner(id, BasicNode::new(request.raft_addr), true)
+            .add_learner(id, BasicNode::new(&request.raft_addr), true)
             .await
             .map_err(|err| KronError::IpcUnavailable(err.to_string()))?;
+        self.write_command(RaftCommand::AddNode {
+            node: NodeInfo {
+                node_id: self.node_name.clone(),
+                http_addr: self.http_addr.clone(),
+                raft_addr: self.raft_addr.clone(),
+            },
+        })
+        .await?;
+        self.write_command(RaftCommand::AddNode { node }).await?;
         let metrics = self.raft.metrics().borrow().clone();
         let mut voters: BTreeSet<u64> =
             metrics.membership_config.membership().voter_ids().collect();
@@ -640,11 +662,18 @@ impl OpenRaftCluster {
 
     fn not_leader_response(&self) -> serde_json::Value {
         let leader_id = self.raft.metrics().borrow().current_leader;
-        let leader_http = if leader_id == Some(self.node_id) {
-            Some(self.http_addr.clone())
-        } else {
-            None
-        };
+        let leader_http = leader_id.and_then(|id| {
+            if id == self.node_id {
+                Some(self.http_addr.clone())
+            } else {
+                self.store
+                    .app_state()
+                    .nodes
+                    .values()
+                    .find(|node| parse_node_id(&node.node_id) == id)
+                    .map(|node| node.http_addr.clone())
+            }
+        });
         serde_json::json!({
             "error": "not_leader",
             "leader_id": leader_id,
@@ -1078,10 +1107,11 @@ fn authenticate(cluster: &OpenRaftCluster, headers: &HeaderMap) -> Result<AuthCo
             .map_err(|err| format!("unable to read token file: {err}"))?;
         let token_file: TokenFile =
             serde_json::from_str(&content).map_err(|err| format!("invalid token file: {err}"))?;
+        token_file.validate()?;
         return token_file
             .tokens
             .into_iter()
-            .find(|entry| ipc::secure_eq(entry.token.as_bytes(), bearer.as_bytes()))
+            .find(|entry| token_entry_matches(entry, bearer, Utc::now()))
             .map(|entry| AuthContext {
                 actor: entry.name,
                 role: entry.role,
@@ -1098,6 +1128,64 @@ fn authenticate(cluster: &OpenRaftCluster, headers: &HeaderMap) -> Result<AuthCo
         });
     }
     Err("unknown token".to_string())
+}
+
+impl TokenFile {
+    fn validate(&self) -> Result<(), String> {
+        for entry in &self.tokens {
+            let has_plaintext = !entry.token.is_empty();
+            let has_hash = entry
+                .token_sha256
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            if has_plaintext == has_hash {
+                return Err(format!(
+                    "token entry '{}' must set exactly one of token or token_sha256",
+                    entry.name
+                ));
+            }
+            if let Some(hash) = entry.token_sha256.as_deref() {
+                if !is_sha256_hex(hash) {
+                    return Err(format!(
+                        "token entry '{}' has invalid token_sha256; expected 64 hex characters",
+                        entry.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn token_entry_matches(entry: &TokenEntry, bearer: &str, now: chrono::DateTime<Utc>) -> bool {
+    if entry.not_before.is_some_and(|not_before| now < not_before) {
+        return false;
+    }
+    if entry.expires_at.is_some_and(|expires_at| now >= expires_at) {
+        return false;
+    }
+    if !entry.token.is_empty() && ipc::secure_eq(entry.token.as_bytes(), bearer.as_bytes()) {
+        return true;
+    }
+    if let Some(expected_hash) = entry.token_sha256.as_deref() {
+        let actual_hash = sha256_hex(bearer.as_bytes());
+        return ipc::secure_eq(expected_hash.as_bytes(), actual_hash.as_bytes());
+    }
+    false
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn audit(
@@ -1284,5 +1372,93 @@ mod tests {
         assert!(tenant_matches(Some("tenant-a"), Some("tenant-a")));
         assert!(!tenant_matches(Some("tenant-a"), Some("tenant-b")));
         assert!(!tenant_matches(Some("tenant-a"), None));
+    }
+
+    #[test]
+    fn token_entry_accepts_sha256_hash_without_plaintext_secret() {
+        let entry = TokenEntry {
+            name: "worker".to_string(),
+            token: String::new(),
+            token_sha256: Some(sha256_hex(b"secret-worker-token")),
+            role: AuthRole::Worker,
+            tenant_id: None,
+            not_before: None,
+            expires_at: None,
+        };
+        assert!(token_entry_matches(
+            &entry,
+            "secret-worker-token",
+            Utc::now()
+        ));
+        assert!(!token_entry_matches(&entry, "wrong-token", Utc::now()));
+    }
+
+    #[test]
+    fn token_entry_enforces_rotation_time_window() {
+        let now = Utc::now();
+        let active = TokenEntry {
+            name: "active".to_string(),
+            token: "secret".to_string(),
+            token_sha256: None,
+            role: AuthRole::Admin,
+            tenant_id: None,
+            not_before: Some(now - chrono::Duration::seconds(1)),
+            expires_at: Some(now + chrono::Duration::seconds(1)),
+        };
+        assert!(token_entry_matches(&active, "secret", now));
+
+        let future = TokenEntry {
+            not_before: Some(now + chrono::Duration::seconds(1)),
+            ..active.clone()
+        };
+        assert!(!token_entry_matches(&future, "secret", now));
+
+        let expired = TokenEntry {
+            expires_at: Some(now),
+            ..active
+        };
+        assert!(!token_entry_matches(&expired, "secret", now));
+    }
+
+    #[test]
+    fn token_file_rejects_ambiguous_and_malformed_secret_entries() {
+        let both = TokenFile {
+            tokens: vec![TokenEntry {
+                name: "bad".to_string(),
+                token: "plain".to_string(),
+                token_sha256: Some(sha256_hex(b"plain")),
+                role: AuthRole::Admin,
+                tenant_id: None,
+                not_before: None,
+                expires_at: None,
+            }],
+        };
+        assert!(both.validate().is_err());
+
+        let malformed = TokenFile {
+            tokens: vec![TokenEntry {
+                name: "bad-hash".to_string(),
+                token: String::new(),
+                token_sha256: Some("not-a-sha256".to_string()),
+                role: AuthRole::Admin,
+                tenant_id: None,
+                not_before: None,
+                expires_at: None,
+            }],
+        };
+        assert!(malformed.validate().is_err());
+
+        let valid = TokenFile {
+            tokens: vec![TokenEntry {
+                name: "good".to_string(),
+                token: String::new(),
+                token_sha256: Some(sha256_hex(b"secret")),
+                role: AuthRole::Admin,
+                tenant_id: None,
+                not_before: None,
+                expires_at: None,
+            }],
+        };
+        assert!(valid.validate().is_ok());
     }
 }

@@ -40,6 +40,227 @@ Recommended enterprise deployment:
 
 Do not expose Kron's HTTP or Raft ports directly to the public internet.
 
+## Secure Deployment Pattern
+
+Recommended production-style topology:
+
+```text
+clients / workers
+      |
+      v
+TLS or mTLS proxy
+      |
+      v
+Kron public HTTP API on 127.0.0.1 or private subnet
+
+Kron node <-> private Raft network <-> Kron node
+```
+
+Use this pattern for every node:
+
+- bind Kron public HTTP to `127.0.0.1` when a local proxy is used;
+- bind Kron Raft to a private interface only;
+- terminate TLS/mTLS at Nginx, Envoy, HAProxy, Caddy, or a service mesh;
+- keep bearer tokens in a secret manager or root-owned environment file;
+- use separate tokens for readers, workers, operators, admins, and Raft peers;
+- allow only workers/clients to reach the public API proxy;
+- allow only peer Kron nodes to reach the Raft listener;
+- ship `kron.audit.jsonl` to a central log system.
+
+## Nginx TLS Example
+
+This protects the public API with HTTPS while Kron listens locally:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name kron.internal.example.com;
+
+    ssl_certificate     /etc/ssl/kron/fullchain.pem;
+    ssl_certificate_key /etc/ssl/kron/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://127.0.0.1:7379;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+}
+```
+
+Start Kron behind it:
+
+```bash
+kron --data-dir /var/lib/kron server start \
+  --node-id n1 \
+  --http 127.0.0.1:7379 \
+  --raft 10.0.10.11:7380
+```
+
+## Envoy mTLS Sketch
+
+Use Envoy or a service mesh when clients/workers must present certificates.
+Kron still sees bearer tokens; Envoy enforces transport identity.
+This is a structural example, not a complete production Envoy configuration.
+
+```yaml
+static_resources:
+  listeners:
+    - name: kron_https
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 443
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /etc/envoy/tls/server.crt }
+                    private_key: { filename: /etc/envoy/tls/server.key }
+                validation_context:
+                  trusted_ca: { filename: /etc/envoy/tls/ca.crt }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: kron
+                route_config:
+                  virtual_hosts:
+                    - name: kron
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: kron_local }
+  clusters:
+    - name: kron_local
+      connect_timeout: 1s
+      type: STATIC
+      load_assignment:
+        cluster_name: kron_local
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 7379
+```
+
+## Firewall Rules
+
+Example intent for a 3-node private cluster:
+
+```text
+allow workers -> proxy:443
+allow operators -> proxy:443
+allow kron nodes -> raft:7380
+deny internet -> kron:7379
+deny internet -> raft:7380
+deny workers -> raft:7380
+```
+
+The Raft port is an internal consensus port. It should not be reachable by
+normal clients or workers.
+
+## Systemd Hardening Example
+
+```ini
+[Service]
+User=kron
+Group=kron
+EnvironmentFile=/etc/kron/kron.env
+ExecStart=/usr/local/bin/kron --data-dir /var/lib/kron server start \
+  --node-id n1 \
+  --http 127.0.0.1:7379 \
+  --raft 10.0.10.11:7380
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kron
+RestrictAddressFamilies=AF_INET AF_INET6
+```
+
+`/etc/kron/kron.env` should be owned by root and readable only by root:
+
+```text
+KRON_TOKEN=replace-with-bootstrap-secret
+```
+
+Prefer `kron.tokens.json` for ongoing role-scoped access and rotation.
+
+## Token Rotation Runbook
+
+Kron reloads `kron.tokens.json` on each request, so rotation does not require a
+server restart.
+
+1. Generate a new high-entropy token.
+2. Add the new token beside the old token in `kron.tokens.json`.
+3. Prefer `token_sha256` for the new entry.
+4. Set `not_before` to the start of the rotation window.
+5. Set `expires_at` on the old token to the end of the overlap window.
+6. Deploy the new token to clients/workers/peers.
+7. Confirm successful requests in `kron.audit.jsonl`.
+8. Remove the old token after it expires.
+9. Verify old-token requests fail.
+
+For Raft peer token rotation, roll the new token to every node before removing
+the old peer token. During alpha deployments, keep a short maintenance window
+for token rotation so failed peer authentication is easy to diagnose.
+
+Compute a SHA-256 token hash:
+
+```bash
+# Linux
+printf '%s' "$KRON_NEW_TOKEN" | sha256sum | awk '{print $1}'
+
+# macOS
+printf '%s' "$KRON_NEW_TOKEN" | shasum -a 256 | awk '{print $1}'
+```
+
+## Transport Security Boundary
+
+Kron's built-in security model covers application authorization:
+
+- bearer token authentication;
+- role authorization;
+- tenant scoping;
+- audit records;
+- hash-chain verification.
+
+The deployment layer should cover transport security:
+
+- TLS certificates;
+- client certificates for mTLS;
+- certificate rotation;
+- public/private network boundaries;
+- L4/L7 firewalling;
+- service mesh policy.
+
+This split keeps Kron small and portable while still allowing secure enterprise
+deployment through standard infrastructure components.
+
+## Cluster Endpoint Metadata
+
+Leader redirects use endpoint metadata replicated through Raft during node join.
+For static clusters, keep node HTTP/Raft addresses stable across restarts.
+Changing node addresses should be treated as a controlled membership operation:
+
+1. remove or stop the old node address;
+2. join the node with the new HTTP/Raft address;
+3. verify follower `not_leader` responses include `leader_http`;
+4. verify Python Client, Python Worker, and CLI requests follow the redirect.
+
+Future Kron versions may add automatic endpoint reconciliation during leadership
+changes. In `0.1.x`, explicit join metadata is the source of truth.
+
 ## Token And Role Model
 
 Every public API request must send:
@@ -58,23 +279,23 @@ For stronger deployments, create `.kron/kron.tokens.json`:
   "tokens": [
     {
       "name": "admin",
-      "token": "replace-with-secret-admin-token",
+      "token_sha256": "replace-with-64-char-sha256-hex",
       "role": "admin"
     },
     {
       "name": "reader",
-      "token": "replace-with-secret-reader-token",
+      "token_sha256": "replace-with-64-char-sha256-hex",
       "role": "reader"
     },
     {
       "name": "worker-a",
-      "token": "replace-with-secret-worker-token",
+      "token_sha256": "replace-with-64-char-sha256-hex",
       "role": "worker",
       "tenant_id": "tenant-a"
     },
     {
       "name": "raft-peer",
-      "token": "replace-with-secret-raft-token",
+      "token_sha256": "replace-with-64-char-sha256-hex",
       "role": "raft"
     }
   ]
@@ -84,6 +305,34 @@ For stronger deployments, create `.kron/kron.tokens.json`:
 Kron reloads this file for every request. Replacing the file rotates tokens
 online without restarting the server. Keep this file readable only by the Kron
 process user.
+
+Tokens can be stored in plaintext with `token` or as a SHA-256 hex digest with
+`token_sha256`. Hashes reduce accidental secret exposure in config backups and
+reviews. Plaintext tokens remain supported for local development and backward
+compatibility.
+
+Token entries can also define an activation window:
+
+```json
+{
+  "name": "worker-a-v2",
+  "token_sha256": "1f2d...64-hex-chars",
+  "role": "worker",
+  "tenant_id": "tenant-a",
+  "not_before": "2026-06-11T10:00:00Z",
+  "expires_at": "2026-06-18T10:00:00Z"
+}
+```
+
+Rules:
+
+- `not_before` rejects a token before its activation time.
+- `expires_at` rejects a token at or after its expiration time.
+- omitted times mean active immediately and no configured expiry.
+- each entry must set exactly one of `token` or `token_sha256`.
+- `token_sha256` must be a 64-character SHA-256 hex digest.
+- plaintext `token` remains available for development and backward
+  compatibility, but hashed entries are preferred.
 
 Roles:
 
@@ -165,13 +414,14 @@ compliance-certified immutable audit subsystem.
 ## Current Limits
 
 - No native TLS/mTLS inside Kron yet.
-- No token hashing in `kron.tokens.json` yet; protect the file with filesystem
-  permissions and a secret manager.
+- Token hashes are supported, but bearer tokens are still shared secrets; protect
+  clients, environment files, and deployment logs.
 - Tenant isolation is alpha and application-level, not a complete hosted
   multi-tenant platform.
 - Audit logging is append-only JSONL, but not WORM storage or compliance
   certified.
-- No enterprise secret rotation API yet; rotation is file-based.
+- No enterprise secret rotation API yet; rotation is online through
+  `kron.tokens.json`.
 
 These limits are acceptable for alpha testing and private development clusters,
 but they should be treated as blockers for regulated production environments.

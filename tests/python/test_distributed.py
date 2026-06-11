@@ -354,6 +354,63 @@ def test_three_node_cluster_replicates_timer_to_followers(tmp_path):
         assert follower_status == 409
         assert follower_body["error"] == "not_leader"
         assert follower_body["leader_id"] is not None
+        assert follower_body["leader_http"] is not None
+
+        leader_node, _ = wait_until(lambda: current_leader(nodes, token), timeout=15.0)
+        follower_node = next(node for node in nodes if node["name"] != leader_node["name"])
+        redirected_client = kron.Client(f"http://{follower_node['http']}", token)
+        redirected_client.schedule(
+            "redirected_timer",
+            at=(datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            task="send_digest",
+            payload={"kind": "redirected"},
+            max_attempts=1,
+        )
+        wait_until(
+            lambda: kron.Client(f"http://{leader_node['http']}", token).status(
+                "redirected_timer"
+            ),
+            timeout=15.0,
+        )
+    finally:
+        stop_cluster(nodes, processes, token)
+
+
+def test_worker_connected_to_follower_follows_leader_redirect(tmp_path):
+    token = "test-cluster-token"
+    nodes = []
+    processes = []
+    try:
+        nodes, processes = build_three_node_cluster(tmp_path, token)
+        leader_node, _ = wait_until(lambda: current_leader(nodes, token), timeout=15.0)
+        follower_node = next(node for node in nodes if node["name"] != leader_node["name"])
+
+        client = kron.Client(f"http://{leader_node['http']}", token)
+        client.schedule(
+            "worker_redirect_timer",
+            at=(datetime.now(timezone.utc) + timedelta(milliseconds=100)).isoformat(),
+            task="send_digest",
+            payload={"kind": "worker-redirect"},
+            max_attempts=1,
+        )
+
+        calls = []
+        worker = kron.Worker(
+            f"http://{follower_node['http']}",
+            token,
+            worker_id="redirect_worker",
+        )
+
+        @worker.task("send_digest")
+        def send_digest(payload):
+            calls.append(payload)
+
+        wait_until(lambda: worker.run_once(timeout=3.0), timeout=10.0)
+        assert calls == [{"kind": "worker-redirect"}]
+        history = client.history("worker_redirect_timer")
+        event_types = [entry["type"] for entry in history]
+        assert "RUN_CLAIMED" in event_types
+        assert "RUN_SUCCEEDED" in event_types
     finally:
         stop_cluster(nodes, processes, token)
 

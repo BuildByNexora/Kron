@@ -35,7 +35,7 @@ true and continuously tested:
 - 3-node clusters elect a leader without manual intervention.
 - Writes to followers return structured `not_leader` responses with a usable
   leader address.
-- Clients and workers follow leader redirects safely.
+- Clients, workers, and CLI follow one-hop leader redirects safely.
 - Killing the leader during active worker runs does not lose committed state.
 - A new leader expires old worker leases and reclaims abandoned runs.
 - Stale worker completions are rejected by committed state, not only by a
@@ -75,7 +75,9 @@ true and continuously tested:
    }
    ```
 
-   Python `Client`, Python `Worker`, and CLI must follow the redirect once.
+   Status: covered for Python `Client` and CLI request paths; Python `Worker`
+   uses the same redirect-aware request path for register, poll, succeed, and
+   fail. Redirects are intentionally one-hop to avoid loops during elections.
 
 3. Apply-time fencing validation.
 

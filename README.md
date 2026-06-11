@@ -77,6 +77,7 @@ infrastructure stack.
 | Token authentication | IPC and server APIs use bearer/token authentication |
 | Role-based server auth | Server mode supports `reader`, `worker`, `operator`, `admin`, and `raft` roles |
 | Online token reload | `kron.tokens.json` can be updated without restarting the server |
+| Safer token rotation | Token hash entries and activation/expiration windows are supported |
 | Tenant-scoped workers | Server timers and worker polling can be scoped by `tenant_id` |
 | Audit log | Server security decisions are written to append-only hash-chained JSONL audit events |
 | Distributed mode | OpenRaft-backed server mode supports leader election and replication |
@@ -332,10 +333,12 @@ Kron provides:
 - standalone server mode;
 - Python `Client` and `Worker` APIs for server tasks;
 - OpenRaft-backed leader election, log replication, and membership;
+- automatic one-hop leader redirect for Python Client, Python Worker, and CLI;
 - worker leasing and run reclaim;
 - fencing tokens for claimed runs;
 - role-scoped bearer tokens;
 - online token reload through `kron.tokens.json`;
+- token hash entries with activation and expiration windows;
 - tenant-scoped server timers and worker polling;
 - embedded append-only event history;
 - server security audit log with hash-chain verification.
@@ -901,6 +904,11 @@ Server mode supports:
 - tamper-evident audit hash chain;
 - separate public API and Raft API listeners.
 
+Kron does not terminate TLS itself in `0.1.x`. For TLS/mTLS, deploy Kron behind
+a reverse proxy or service mesh. The [Security Guide](docs/usage/security.md)
+includes Nginx TLS, Envoy mTLS, firewall, systemd hardening, and token rotation
+examples.
+
 Roles:
 
 | Role | Access |
@@ -1018,7 +1026,7 @@ pytest -q tests/python                                      PASS
 Observed results:
 
 ```text
-Rust core unit tests:             35 passed
+Rust core unit tests:             40 passed
 Rust integration tests:           17 passed
 Manual core stress test:           1 passed
 Python integration tests:         20 passed
@@ -1039,11 +1047,11 @@ Stress areas covered:
 | Shutdown | graceful wait and timeout behavior are tested |
 | Raft storage | reopen, truncate, purge, snapshots, corrupted records, tail truncation |
 | Distributed cluster | single-node client/worker roundtrip |
-| 3-node cluster | join, replication, follower write rejection |
+| 3-node cluster | join, replication, follower write rejection, client and worker redirect |
 | Leader failover | leader kill, new election, write after failover |
 | Worker recovery | abandoned run is reclaimed after leader kill and lease expiry |
 | Fencing tokens | stale worker completions are rejected |
-| Security model | RBAC role rules, tenant matching, and audit hash-chain verification are tested |
+| Security model | RBAC role rules, tenant matching, hash-chain audit, hashed tokens, and token windows are tested |
 | Python async wrapper | async start/status/list/shutdown wrapper behavior |
 
 The manual stress command exercises the embedded scheduler with 1000 due timers:

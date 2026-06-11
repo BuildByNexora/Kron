@@ -21,7 +21,7 @@ Server mode is experimental in `0.1.x`. It is useful for local testing of serial
 Known alpha limitations:
 
 - the Raft store is segmented and checksummed, but still alpha storage;
-- leader redirect is still basic;
+- leader redirect is one-hop for CLI, Python Client, and Python Worker;
 - the required 3-node failure matrix is not complete;
 - storage compatibility is not guaranteed before v1.0.
 

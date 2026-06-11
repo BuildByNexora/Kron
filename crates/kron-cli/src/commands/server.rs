@@ -152,17 +152,62 @@ pub fn request(
     let endpoint = std::fs::read_to_string(data_dir.join("kron.http"))
         .map_err(|_| "server endpoint not found; is `kron server start` running?".to_string())?;
     let token = server_request_token(data_dir)?;
+    let mut endpoint = endpoint.trim().to_string();
+    let original_endpoint = normalize_endpoint(&endpoint);
+    for attempt in 0..=1 {
+        let (status, value) = request_once(&endpoint, token.trim(), method, path, &body)?;
+        if (200..300).contains(&status) {
+            let normalized_endpoint = normalize_endpoint(&endpoint);
+            if normalized_endpoint != original_endpoint {
+                if let Err(err) = std::fs::write(
+                    data_dir.join("kron.http"),
+                    format!("{normalized_endpoint}\n"),
+                ) {
+                    eprintln!(
+                        "warning: request followed leader redirect to {normalized_endpoint}, \
+                         but failed to update kron.http: {err}"
+                    );
+                }
+            }
+            return Ok(value);
+        }
+        if attempt == 0 && value.get("error").and_then(|v| v.as_str()) == Some("not_leader") {
+            if let Some(leader_http) = value.get("leader_http").and_then(|v| v.as_str()) {
+                if !leader_http.trim().is_empty() {
+                    endpoint = normalize_endpoint(leader_http);
+                    continue;
+                }
+            }
+        }
+        let message = value
+            .get("error")
+            .or_else(|| value.get("message"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("server request failed");
+        return Err(format!("HTTP {status}: {message}"));
+    }
+    Err("leader redirect retry failed".to_string())
+}
+
+fn request_once(
+    endpoint: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<(u16, serde_json::Value), String> {
     let body = if body.is_null() {
         String::new()
     } else {
-        serde_json::to_string(&body).map_err(|e| e.to_string())?
+        serde_json::to_string(body).map_err(|e| e.to_string())?
     };
-    let mut stream = TcpStream::connect(endpoint.trim()).map_err(|e| e.to_string())?;
+    let endpoint = normalize_endpoint(endpoint);
+    let mut stream = TcpStream::connect(&endpoint).map_err(|e| e.to_string())?;
     write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        endpoint.trim(),
-        token.trim(),
+        endpoint,
+        token,
         body.len(),
         body
     )
@@ -181,15 +226,15 @@ pub fn request(
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| "invalid HTTP status line".to_string())?;
     let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
-    if !(200..300).contains(&status) {
-        let message = value
-            .get("error")
-            .or_else(|| value.get("message"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("server request failed");
-        return Err(format!("HTTP {status}: {message}"));
-    }
-    Ok(value)
+    Ok((status, value))
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    endpoint
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 #[derive(Deserialize)]
